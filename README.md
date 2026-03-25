@@ -312,3 +312,22 @@ Backuper is a thin orchestration layer around stable backup tools.
 
 That makes it suitable for production use without turning the project into a full backup engine.
 
+## Development
+
+Current bootstrap:
+
+- `go.mod` with module `github.com/bartek5186/backuper`
+- `cmd/backuper` with a minimal CLI
+- `configs/example.json` with a valid starter config for multiple databases and directories
+
+Config supports both:
+
+- legacy single-database jobs with top-level `database` and per-job `output_dir`
+- multi-target setup with top-level `databases[]`, `directories[]`, `jobs[].database_ref` and `jobs[].directory_refs`
+- omitting `databases[].tables` means dumping the whole database; `tables: ["*"]` is not needed
+
+Quick check:
+
+```bash
+go run ./cmd/backuper validate -config ./configs/example.json
+```
