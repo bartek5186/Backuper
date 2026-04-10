@@ -12,7 +12,6 @@ Backuper does **not** implement database dumping or file snapshotting from scrat
 
 - `mariadb-dump` or `mysqldump` for database dumps
 - `restic` for file and snapshot backups
-- Healthchecks for job monitoring and failure detection
 
 ## Goals
 
@@ -44,20 +43,6 @@ Backuper runs separate backup jobs for:
 
 Each directory is backed up with `restic` into the same or a separate repository.
 
-### Monitoring flow
-
-Each job can report its state to Healthchecks:
-
-- start
-- success
-- failure
-
-This makes it possible to detect:
-
-- failed jobs
-- stuck jobs
-- missing scheduled runs
-
 ## Why this design
 
 Backuper intentionally avoids reimplementing backup engines.
@@ -84,7 +69,7 @@ mariadb-dump --single-transaction --quick --routines --triggers --events myapp |
 
 ### 2. Restic backup jobs
 
-A restic job is responsible for snapshotting one or more directories.
+A restic job is responsible for snapshotting one or more source paths.
 
 Typical examples:
 
@@ -102,16 +87,6 @@ A simple first-version policy can look like this:
 - uploads snapshots: keep 48 hourly and 14 daily backups
 - videos snapshots: keep 14 daily backups
 
-### 4. Healthchecks integration
-
-Every job can have its own Healthchecks ID.
-
-Backuper should notify Healthchecks when a job:
-
-- starts
-- finishes successfully
-- fails
-
 ## Minimal config structure
 
 The first version uses a small JSON configuration file.
@@ -119,12 +94,9 @@ The first version uses a small JSON configuration file.
 Main sections:
 
 - `app`
-- `paths`
 - `database`
 - `restic`
-- `healthchecks`
 - `jobs`
-- `retention`
 
 ## Example config
 
@@ -134,18 +106,8 @@ Main sections:
     "name": "backuper",
     "timezone": "Europe/Warsaw"
   },
-  "paths": {
-    "db_dump_dir": "/var/backups/myapp/db",
-    "uploads_dir": "/srv/myapp/uploads",
-    "videos_dir": "/srv/myapp/videos"
-  },
   "database": {
     "dump_tool": "mariadb-dump",
-    "host": "127.0.0.1",
-    "port": 3306,
-    "name": "myapp",
-    "username": "backup_user",
-    "password_env": "BACKUP_DB_PASSWORD",
     "dump_flags": [
       "--single-transaction",
       "--quick",
@@ -157,17 +119,7 @@ Main sections:
   },
   "restic": {
     "binary": "/usr/bin/restic",
-    "repository": "sftp:backup@100.88.10.24:/volume1/backups/restic/myapp",
-    "password_env": "RESTIC_PASSWORD"
-  },
-  "healthchecks": {
-    "base_url": "https://hc-ping.com",
-    "jobs": {
-      "db_dump": "11111111-1111-1111-1111-111111111111",
-      "restic_db": "22222222-2222-2222-2222-222222222222",
-      "restic_uploads": "33333333-3333-3333-3333-333333333333",
-      "restic_videos": "44444444-4444-4444-4444-444444444444"
-    }
+    "repository": "sftp:backup@100.88.10.24:/volume1/backups/restic/myapp"
   },
   "jobs": [
     {
@@ -175,8 +127,12 @@ Main sections:
       "type": "database_dump",
       "schedule": "0 2 * * *",
       "timeout_minutes": 90,
-      "output_dir": "/var/backups/myapp/db",
-      "healthcheck_id": "11111111-1111-1111-1111-111111111111"
+      "database_name": "myapp",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "backup_user",
+      "password": "MYAPP_DB_PASSWORD",
+      "retention_days": 7
     },
     {
       "name": "restic_db",
@@ -184,12 +140,14 @@ Main sections:
       "schedule": "20 2 * * *",
       "timeout_minutes": 120,
       "sources": [
-        "/var/backups/myapp/db"
+        "./backups/db_dump"
       ],
       "tags": [
         "db"
       ],
-      "healthcheck_id": "22222222-2222-2222-2222-222222222222"
+      "retention": {
+        "keep_daily": 14
+      }
     },
     {
       "name": "restic_uploads",
@@ -202,7 +160,10 @@ Main sections:
       "tags": [
         "uploads"
       ],
-      "healthcheck_id": "33333333-3333-3333-3333-333333333333"
+      "retention": {
+        "keep_hourly": 48,
+        "keep_daily": 14
+      }
     },
     {
       "name": "restic_videos",
@@ -215,14 +176,10 @@ Main sections:
       "tags": [
         "videos"
       ],
-      "healthcheck_id": "44444444-4444-4444-4444-444444444444"
+      "retention": {
+        "keep_daily": 14
+      }
     }
-  ],
-  "retention": {
-    "db_keep_daily": 14,
-    "uploads_keep_hourly": 48,
-    "uploads_keep_daily": 14,
-    "videos_keep_daily": 14
   }
 }
 ```
@@ -233,21 +190,21 @@ Main sections:
 
 General application metadata.
 
-### `paths`
-
-Local directories used by Backuper.
-
 ### `database`
 
-Database dump configuration. This controls how Backuper invokes `mariadb-dump` or `mysqldump`.
+Shared database dump defaults. This controls how Backuper invokes `mariadb-dump`
+or `mysqldump` for every `database_dump` job.
+This section contains only shared behavior such as `dump_tool`, `dump_flags` and `gzip`.
 
 ### `restic`
 
-Shared restic configuration. This defines the repository and the password source.
-
-### `healthchecks`
-
-Job monitoring configuration. Each job can be mapped to a dedicated Healthchecks check.
+Shared restic configuration. This defines the repository.
+The restic repository password is always read from `RESTIC_PASSWORD`.
+If the repository uses `sftp:` and `SFTP_PASSWORD` is present in the environment,
+Backuper automatically enables its internal restic SFTP proxy, so no `sftp.command`
+needs to be exposed in `config.json`.
+At startup, Backuper also loads a local `.env` file from the current working directory
+if it exists. Existing environment variables are not overridden.
 
 ### `jobs`
 
@@ -256,9 +213,20 @@ Defines all executable jobs. The first version supports two main job types:
 - `database_dump`
 - `restic_backup`
 
-### `retention`
+For `restic_backup` jobs, retention can be defined per job with an optional `retention` block.
+Supported fields are `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, and `keep_yearly`.
+For `database_dump` jobs, connection details live directly in the job:
 
-Retention rules used when running `restic forget --prune`.
+- `database_name`
+- `host`
+- `port`
+- `user`
+- `password`
+
+`password` is the name of the environment variable that stores the database password.
+Local dump file retention is controlled by `retention_days`.
+Dump files are written per job into `./backups/<job_name>` by default, or into
+`job.output_dir` if you want a custom local path.
 
 ## Suggested first-version job set
 
@@ -279,8 +247,81 @@ Backuper should:
 - enforce one running instance per job
 - collect exit status and output
 - fail clearly when external tools fail
-- report failures to Healthchecks
 - keep backup logic separated by data type
+
+## Running
+
+The default production-style start is simply:
+
+```bash
+go run ./cmd/backuper
+```
+
+This mode:
+
+- loads `.env` from the current working directory
+- loads config from `./configs/config.json`
+- checks at startup whether required binaries exist on the host:
+  `restic` and/or the configured database dump tool
+- starts the scheduler
+- starts the HTTP API on `127.0.0.1:8080`
+
+There is also an explicit equivalent command:
+
+```bash
+go run ./cmd/backuper serve -config ./configs/config.json -listen 127.0.0.1:8080
+```
+
+## HTTP API
+
+Backuper exposes a small read-only HTTP API for restic snapshots in `backuper`
+default mode and in `backuper serve`. You can still run the API separately if needed.
+
+Start it with:
+
+```bash
+go run ./cmd/backuper api -config ./configs/config.json -listen 127.0.0.1:8080
+```
+
+Available endpoint:
+
+- `GET /api/restic/snapshots`
+
+Optional filters:
+
+- `tag=a`
+- `tag=a,b`
+- `tag=a&tag=b`
+
+Example:
+
+```bash
+curl 'http://127.0.0.1:8080/api/restic/snapshots?tag=a&tag=b'
+```
+
+The endpoint runs `restic snapshots --json` against the configured repository and
+returns the currently available snapshots in JSON form.
+
+## Restore
+
+To restore the latest snapshot for a tag:
+
+```bash
+go run ./cmd/backuper restore -tag a -target /tmp/restore_a
+```
+
+This command:
+
+- loads `.env`
+- loads `./configs/config.json` by default
+- finds the newest snapshot matching the provided tag
+- runs `restic restore` into the target directory
+
+You can also restore an explicit snapshot ID:
+
+```bash
+go run ./cmd/backuper restore -snapshot 862bd04a -target /tmp/restore_a
+```
 
 ## Not in scope for v1
 
@@ -302,9 +343,8 @@ A practical implementation order:
 1. config loading and validation
 2. database dump runner
 3. restic backup runner
-4. Healthchecks integration
-5. retention runner
-6. lock handling and structured logs
+4. retention runner
+5. lock handling and structured logs
 
 ## Summary
 
@@ -317,17 +357,17 @@ That makes it suitable for production use without turning the project into a ful
 Current bootstrap:
 
 - `go.mod` with module `github.com/bartek5186/backuper`
-- `cmd/backuper` with a minimal CLI
-- `configs/example.json` with a valid starter config for multiple databases and directories
-
-Config supports both:
-
-- legacy single-database jobs with top-level `database` and per-job `output_dir`
-- multi-target setup with top-level `databases[]`, `directories[]`, `jobs[].database_ref` and `jobs[].directory_refs`
-- omitting `databases[].tables` means dumping the whole database; `tables: ["*"]` is not needed
+- `cmd/backuper` with scheduler, API, restore, validation and runtime dependency checks
+- `configs/example.json` with a starter config using shared database defaults and per-job DB connections
 
 Quick check:
 
 ```bash
 go run ./cmd/backuper validate -config ./configs/example.json
+```
+
+Template runner:
+
+```bash
+go run ./cmd/backuper run -config ./configs/example.json -jobs restic_db,restic_uploads
 ```

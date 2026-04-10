@@ -3,80 +3,20 @@
     "name": "backuper",
     "timezone": "Europe/Warsaw"
   },
-  "databases": [
-    {
-      "name": "app_main",
-      "database_name": "myapp",
-      "dump_tool": "mariadb-dump",
-      "host": "127.0.0.1",
-      "port": 3306,
-      "username": "backup_user",
-      "password_env": "BACKUP_DB_PASSWORD",
-      "dump_flags": [
-        "--single-transaction",
-        "--quick",
-        "--routines",
-        "--triggers",
-        "--events"
-      ],
-      "gzip": true,
-      "output_dir": "/var/backups/backuper/db/app_main"
-    },
-    {
-      "name": "billing",
-      "database_name": "billing",
-      "dump_tool": "mariadb-dump",
-      "host": "127.0.0.1",
-      "port": 3306,
-      "username": "backup_user",
-      "password_env": "BACKUP_DB_PASSWORD",
-      "gzip": true,
-      "output_dir": "/var/backups/backuper/db/billing"
-    }
-  ],
-  "directories": [
-    {
-      "name": "uploads_public",
-      "path": "/srv/myapp/uploads/public",
-      "excludes": [
-        "*.tmp",
-        "*.part"
-      ]
-    },
-    {
-      "name": "uploads_private",
-      "path": "/srv/myapp/uploads/private",
-      "excludes": [
-        "*.tmp"
-      ]
-    },
-    {
-      "name": "videos_raw",
-      "path": "/srv/myapp/videos/raw",
-      "excludes": [
-        "*.part"
-      ]
-    },
-    {
-      "name": "videos_processed",
-      "path": "/srv/myapp/videos/processed",
-      "excludes": []
-    }
-  ],
+  "database": {
+    "dump_tool": "mariadb-dump",
+    "dump_flags": [
+      "--single-transaction",
+      "--quick",
+      "--routines",
+      "--triggers",
+      "--events"
+    ],
+    "gzip": true
+  },
   "restic": {
     "binary": "/usr/bin/restic",
-    "repository": "sftp:backup@100.88.10.24:/volume1/backups/restic/myapp",
-    "password_env": "RESTIC_PASSWORD"
-  },
-  "healthchecks": {
-    "base_url": "https://hc-ping.com",
-    "jobs": {
-      "db_app_main_dump": "11111111-1111-1111-1111-111111111111",
-      "db_billing_dump": "22222222-2222-2222-2222-222222222222",
-      "restic_db": "33333333-3333-3333-3333-333333333333",
-      "restic_uploads": "44444444-4444-4444-4444-444444444444",
-      "restic_videos": "55555555-5555-5555-5555-555555555555"
-    }
+    "repository": "sftp:backup@100.88.10.24:/volume1/backups/restic/myapp"
   },
   "jobs": [
     {
@@ -84,16 +24,24 @@
       "type": "database_dump",
       "schedule": "0 2 * * *",
       "timeout_minutes": 90,
-      "database_ref": "app_main",
-      "healthcheck_id": "11111111-1111-1111-1111-111111111111"
+      "database_name": "myapp",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "backup_user",
+      "password": "APP_MAIN_DB_PASSWORD",
+      "retention_days": 7
     },
     {
       "name": "db_billing_dump",
       "type": "database_dump",
       "schedule": "10 2 * * *",
       "timeout_minutes": 90,
-      "database_ref": "billing",
-      "healthcheck_id": "22222222-2222-2222-2222-222222222222"
+      "database_name": "billing",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "backup_user",
+      "password": "BILLING_DB_PASSWORD",
+      "retention_days": 7
     },
     {
       "name": "restic_db",
@@ -101,47 +49,48 @@
       "schedule": "30 2 * * *",
       "timeout_minutes": 180,
       "sources": [
-        "/var/backups/backuper/db/app_main",
-        "/var/backups/backuper/db/billing"
+        "./backups/db_app_main_dump",
+        "./backups/db_billing_dump"
       ],
       "tags": [
         "db"
       ],
-      "healthcheck_id": "33333333-3333-3333-3333-333333333333"
+      "retention": {
+        "keep_daily": 14
+      }
     },
     {
       "name": "restic_uploads",
       "type": "restic_backup",
       "schedule": "15 * * * *",
       "timeout_minutes": 180,
-      "directory_refs": [
-        "uploads_public",
-        "uploads_private"
+      "sources": [
+        "/srv/myapp/uploads/public",
+        "/srv/myapp/uploads/private"
       ],
       "tags": [
         "uploads"
       ],
-      "healthcheck_id": "44444444-4444-4444-4444-444444444444"
+      "retention": {
+        "keep_hourly": 48,
+        "keep_daily": 14
+      }
     },
     {
       "name": "restic_videos",
       "type": "restic_backup",
       "schedule": "30 */6 * * *",
       "timeout_minutes": 720,
-      "directory_refs": [
-        "videos_raw",
-        "videos_processed"
+      "sources": [
+        "/srv/myapp/videos/raw",
+        "/srv/myapp/videos/processed"
       ],
       "tags": [
         "videos"
       ],
-      "healthcheck_id": "55555555-5555-5555-5555-555555555555"
+      "retention": {
+        "keep_daily": 14
+      }
     }
-  ],
-  "retention": {
-    "db_keep_daily": 14,
-    "uploads_keep_hourly": 48,
-    "uploads_keep_daily": 14,
-    "videos_keep_daily": 14
-  }
+  ]
 }

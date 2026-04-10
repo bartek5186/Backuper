@@ -2,3 +2,6 @@
 /dist/
 /coverage.out
 *.test
+/configs/config.json
+/.env
+/.codex
