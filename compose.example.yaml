@@ -1,0 +1,30 @@
+services:
+  backuper:
+    image: ghcr.io/bartek5186/backuper:latest
+    container_name: backuper
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    working_dir: /app
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./backups:/app/backups
+      - /srv/example/uploads:/srv/example/uploads:ro
+      - /srv/example/videos:/srv/example/videos:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+# Optional:
+# If your database host is another Docker service, attach this container to the
+# same network and set `jobs[].host` in config.json to that service name.
+#
+# networks:
+#   default:
+#     external: true
+#     name: your-shared-network

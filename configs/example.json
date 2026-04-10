@@ -3,18 +3,20 @@
     "name": "backuper",
     "timezone": "Europe/Warsaw"
   },
-  "database": {
-    "dump_tool": "mariadb-dump",
-    "dump_flags": [
-      "--single-transaction",
-      "--quick",
-      "--routines",
-      "--triggers",
-      "--events"
-    ],
-    "gzip": true,
-    "restic": true
-  },
+  "database": [
+    {
+      "name": "mysql",
+      "type": "mariadb",
+      "gzip": true,
+      "restic": true
+    },
+    {
+      "name": "postgres",
+      "type": "postgres",
+      "gzip": true,
+      "restic": true
+    }
+  ],
   "restic": {
     "binary": "/usr/bin/restic",
     "repository": "sftp:backup@100.88.10.24:/volume1/backups/restic/myapp"
@@ -25,6 +27,7 @@
       "type": "database_dump",
       "schedule": "0 2 * * *",
       "timeout_minutes": 90,
+      "database_config": "mysql",
       "database_name": "myapp",
       "host": "127.0.0.1",
       "port": 3306,
@@ -40,9 +43,10 @@
       "type": "database_dump",
       "schedule": "10 2 * * *",
       "timeout_minutes": 90,
+      "database_config": "postgres",
       "database_name": "billing",
       "host": "127.0.0.1",
-      "port": 3306,
+      "port": 5432,
       "user": "backup_user",
       "password": "BILLING_DB_PASSWORD",
       "retention": {

@@ -3,18 +3,20 @@
     "name": "backuper",
     "timezone": "Europe/Warsaw"
   },
-  "database": {
-    "dump_tool": "mariadb-dump",
-    "dump_flags": [
-      "--single-transaction",
-      "--quick",
-      "--routines",
-      "--triggers",
-      "--events"
-    ],
-    "gzip": true,
-    "restic": true
-  },
+  "database": [
+    {
+      "name": "mysql",
+      "type": "mariadb",
+      "gzip": true,
+      "restic": true
+    },
+    {
+      "name": "postgres",
+      "type": "postgres",
+      "gzip": true,
+      "restic": true
+    }
+  ],
   "restic": {
     "binary": "/usr/bin/restic",
     "repository": "sftp://user@warehouse:22//vault/backups/footballmat"
@@ -25,6 +27,7 @@
       "type": "database_dump",
       "schedule": "*/5 * * * *",
       "timeout_minutes": 90,
+      "database_config": "mysql",
       "database_name": "user",
       "host": "host",
       "port": 3306,

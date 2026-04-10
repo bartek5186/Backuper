@@ -27,6 +27,7 @@ const version = "0.1.0"
 
 const (
 	resticPasswordEnv         = "RESTIC_PASSWORD"
+	postgresPasswordEnv       = "PGPASSWORD"
 	sftpPasswordEnv           = "SFTP_PASSWORD"
 	backuperResticRepoEnv     = "BACKUPER_RESTIC_REPOSITORY"
 	defaultConfigPath         = "./configs/config.json"
@@ -37,10 +38,48 @@ const (
 	defaultHealthMaxAge       = 24 * time.Hour
 )
 
+const defaultDatabaseConfigName = "default"
+
 var databaseDumpRetryBackoff = []time.Duration{
 	15 * time.Second,
 	30 * time.Second,
 	60 * time.Second,
+}
+
+type databaseDumpKind string
+
+const (
+	databaseDumpKindMySQL    databaseDumpKind = "mysql"
+	databaseDumpKindPostgres databaseDumpKind = "postgres"
+)
+
+type databaseConfigType string
+
+const (
+	databaseConfigTypeMySQL    databaseConfigType = "mysql"
+	databaseConfigTypeMariaDB  databaseConfigType = "mariadb"
+	databaseConfigTypePostgres databaseConfigType = "postgres"
+)
+
+var (
+	defaultMySQLDumpFlags = []string{
+		"--single-transaction",
+		"--quick",
+		"--routines",
+		"--triggers",
+		"--events",
+	}
+	defaultPostgresDumpFlags = []string{
+		"--clean",
+		"--if-exists",
+	}
+)
+
+type databaseDumpSpec struct {
+	configType databaseConfigType
+	binary     string
+	kind       databaseDumpKind
+	flags      []string
 }
 
 type resticSFTPConnection struct {
@@ -482,11 +521,11 @@ func runScheduler(args []string) int {
 }
 
 type config struct {
-	App      appConfig              `json:"app"`
-	Paths    pathsConfig            `json:"paths"`
-	Database databaseDefaultsConfig `json:"database"`
-	Restic   resticConfig           `json:"restic"`
-	Jobs     []jobConfig            `json:"jobs"`
+	App      appConfig          `json:"app"`
+	Paths    pathsConfig        `json:"paths"`
+	Database databaseConfigList `json:"database"`
+	Restic   resticConfig       `json:"restic"`
+	Jobs     []jobConfig        `json:"jobs"`
 }
 
 type appConfig struct {
@@ -500,11 +539,15 @@ type pathsConfig struct {
 	VideosDir  string `json:"videos_dir"`
 }
 
-type databaseDefaultsConfig struct {
-	DumpTool  string   `json:"dump_tool"`
-	DumpFlags []string `json:"dump_flags"`
+type databaseConfigList []databaseConfig
+
+type databaseConfig struct {
+	Name      string   `json:"name,omitempty"`
+	Type      string   `json:"type,omitempty"`
+	DumpTool  string   `json:"dump_tool,omitempty"`
 	Gzip      bool     `json:"gzip"`
 	Restic    *bool    `json:"restic,omitempty"`
+	DumpFlags []string `json:"dump_flags,omitempty"`
 }
 
 type resticConfig struct {
@@ -518,6 +561,7 @@ type jobConfig struct {
 	Schedule       string              `json:"schedule"`
 	TimeoutMinutes int                 `json:"timeout_minutes"`
 	OutputDir      string              `json:"output_dir,omitempty"`
+	DatabaseConfig string              `json:"database_config,omitempty"`
 	DatabaseName   string              `json:"database_name,omitempty"`
 	Host           string              `json:"host,omitempty"`
 	Port           int                 `json:"port,omitempty"`
@@ -568,17 +612,95 @@ type databaseDumpFile struct {
 	modTime time.Time
 }
 
-func (c config) databaseResticEnabled() bool {
-	if c.Database.Restic != nil {
-		return *c.Database.Restic
+func (d *databaseConfigList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*d = nil
+		return nil
 	}
 
-	return strings.TrimSpace(c.Restic.Binary) != "" || strings.TrimSpace(c.Restic.Repository) != ""
+	decodeStrict := func(target any) error {
+		decoder := json.NewDecoder(bytes.NewReader(trimmed))
+		decoder.DisallowUnknownFields()
+		return decoder.Decode(target)
+	}
+
+	if trimmed[0] == '[' {
+		var items []databaseConfig
+		if err := decodeStrict(&items); err != nil {
+			return err
+		}
+		*d = databaseConfigList(items)
+		return nil
+	}
+
+	var item databaseConfig
+	if err := decodeStrict(&item); err != nil {
+		return err
+	}
+	*d = databaseConfigList{item}
+	return nil
+}
+
+func (d databaseConfig) resticEnabled(shared resticConfig) bool {
+	if d.Restic != nil {
+		return *d.Restic
+	}
+
+	return strings.TrimSpace(shared.Binary) != "" || strings.TrimSpace(shared.Repository) != ""
+}
+
+func (c config) resolveDatabaseConfig(job jobConfig) (databaseConfig, string, error) {
+	if len(c.Database) == 0 {
+		return databaseConfig{}, "", fmt.Errorf("job %s cannot run because no database configs are defined", job.Name)
+	}
+
+	selectedName := strings.TrimSpace(job.DatabaseConfig)
+	if selectedName == "" && len(c.Database) == 1 {
+		database := c.Database[0]
+		return database, effectiveDatabaseConfigName(database, 1), nil
+	}
+
+	if selectedName == "" {
+		return databaseConfig{}, "", fmt.Errorf("job %s must define database_config when multiple database configs are configured", job.Name)
+	}
+
+	for _, database := range c.Database {
+		if effectiveDatabaseConfigName(database, len(c.Database)) == selectedName {
+			return database, selectedName, nil
+		}
+	}
+
+	return databaseConfig{}, "", fmt.Errorf("job %s references unknown database_config %q", job.Name, selectedName)
+}
+
+func (c config) databaseResticEnabledForJob(job jobConfig) (bool, error) {
+	database, _, err := c.resolveDatabaseConfig(job)
+	if err != nil {
+		return false, err
+	}
+
+	return database.resticEnabled(c.Restic), nil
+}
+
+func effectiveDatabaseConfigName(database databaseConfig, total int) string {
+	name := strings.TrimSpace(database.Name)
+	if name != "" {
+		return name
+	}
+	if total == 1 {
+		return defaultDatabaseConfigName
+	}
+
+	return ""
 }
 
 type resolvedDatabaseDumpConfig struct {
+	ConfigName    string
+	ConfigType    databaseConfigType
 	Name          string
 	DumpTool      string
+	DumpKind      databaseDumpKind
 	Host          string
 	Port          int
 	User          string
@@ -587,6 +709,80 @@ type resolvedDatabaseDumpConfig struct {
 	ExcludeTables []string
 	DumpFlags     []string
 	Gzip          bool
+	ResticEnabled bool
+}
+
+func resolveDatabaseDumpSpec(database databaseConfig) (databaseDumpSpec, error) {
+	configType := databaseConfigType(strings.ToLower(strings.TrimSpace(database.Type)))
+	if configType != "" {
+		if spec, ok := databaseDumpSpecForType(configType); ok {
+			return spec, nil
+		}
+
+		return databaseDumpSpec{}, fmt.Errorf("unsupported database type %q", database.Type)
+	}
+
+	return resolveLegacyDatabaseDumpSpec(database)
+}
+
+func databaseDumpSpecForType(configType databaseConfigType) (databaseDumpSpec, bool) {
+	switch configType {
+	case databaseConfigTypeMySQL:
+		return databaseDumpSpec{
+			configType: databaseConfigTypeMySQL,
+			binary:     "mysqldump",
+			kind:       databaseDumpKindMySQL,
+			flags:      append([]string(nil), defaultMySQLDumpFlags...),
+		}, true
+	case databaseConfigTypeMariaDB:
+		return databaseDumpSpec{
+			configType: databaseConfigTypeMariaDB,
+			binary:     "mariadb-dump",
+			kind:       databaseDumpKindMySQL,
+			flags:      append([]string(nil), defaultMySQLDumpFlags...),
+		}, true
+	case databaseConfigTypePostgres:
+		return databaseDumpSpec{
+			configType: databaseConfigTypePostgres,
+			binary:     "pg_dump",
+			kind:       databaseDumpKindPostgres,
+			flags:      append([]string(nil), defaultPostgresDumpFlags...),
+		}, true
+	default:
+		return databaseDumpSpec{}, false
+	}
+}
+
+func resolveLegacyDatabaseDumpSpec(database databaseConfig) (databaseDumpSpec, error) {
+	dumpTool := strings.TrimSpace(database.DumpTool)
+	if dumpTool == "" {
+		return databaseDumpSpec{}, fmt.Errorf("database type is required")
+	}
+
+	binaryName := strings.ToLower(filepath.Base(dumpTool))
+	switch {
+	case strings.Contains(binaryName, "pg_dump"):
+		return databaseDumpSpec{
+			configType: databaseConfigTypePostgres,
+			binary:     dumpTool,
+			kind:       databaseDumpKindPostgres,
+			flags:      append([]string(nil), database.DumpFlags...),
+		}, nil
+	case strings.Contains(binaryName, "mariadb-dump"):
+		return databaseDumpSpec{
+			configType: databaseConfigTypeMariaDB,
+			binary:     dumpTool,
+			kind:       databaseDumpKindMySQL,
+			flags:      append([]string(nil), database.DumpFlags...),
+		}, nil
+	default:
+		return databaseDumpSpec{
+			configType: databaseConfigTypeMySQL,
+			binary:     dumpTool,
+			kind:       databaseDumpKindMySQL,
+			flags:      append([]string(nil), database.DumpFlags...),
+		}, nil
+	}
 }
 
 func (e *validationError) Error() string {
@@ -694,21 +890,46 @@ func (s *apiServer) handleResticSnapshots(w http.ResponseWriter, r *http.Request
 func (s *apiServer) collectJobHealthStatuses(ctx context.Context) ([]jobHealthStatus, error) {
 	statuses := make([]jobHealthStatus, 0, len(s.jobs))
 	now := time.Now()
+	dbJobUsesRestic := make(map[string]bool, len(s.jobs))
+	jobConfigErrors := make(map[string]string)
+
+	needsSnapshots := hasJobType(s.jobs, "restic_backup")
+	for _, job := range s.jobs {
+		if job.Type != "database_dump" {
+			continue
+		}
+
+		useRestic, err := s.runner.cfg.databaseResticEnabledForJob(job)
+		if err != nil {
+			jobConfigErrors[job.Name] = err.Error()
+			continue
+		}
+
+		dbJobUsesRestic[job.Name] = useRestic
+		if useRestic {
+			needsSnapshots = true
+		}
+	}
 
 	var (
 		snapshots   []resticSnapshotSummary
 		resticError error
 	)
-	if hasJobType(s.jobs, "restic_backup") || (hasJobType(s.jobs, "database_dump") && s.runner.cfg.databaseResticEnabled()) {
+	if needsSnapshots {
 		snapshots, resticError = s.runner.listResticSnapshotSummaries(ctx, nil)
 	}
 
 	for _, job := range s.jobs {
 		status := jobHealthStatus{Name: job.Name}
+		if message, ok := jobConfigErrors[job.Name]; ok {
+			status.Error = message
+			statuses = append(statuses, status)
+			continue
+		}
 
 		switch job.Type {
 		case "database_dump":
-			if s.runner.cfg.databaseResticEnabled() {
+			if dbJobUsesRestic[job.Name] {
 				if resticError != nil {
 					status.Error = resticError.Error()
 					break
@@ -1008,8 +1229,26 @@ func (c config) validate() error {
 	}
 
 	jobNames := make(map[string]struct{}, len(c.Jobs))
+	databaseNames := make(map[string]struct{}, len(c.Database))
 	needsDatabase := false
 	needsRestic := false
+
+	for i, database := range c.Database {
+		prefix := databaseConfigValidationPrefix(i, len(c.Database))
+		problems = appendDatabaseConfigProblems(problems, prefix, database)
+
+		name := effectiveDatabaseConfigName(database, len(c.Database))
+		if name == "" {
+			problems = append(problems, prefix+".name is required when multiple database configs are defined")
+			continue
+		}
+
+		if _, exists := databaseNames[name]; exists {
+			problems = append(problems, fmt.Sprintf("database config name %q must be unique", name))
+			continue
+		}
+		databaseNames[name] = struct{}{}
+	}
 
 	for i, job := range c.Jobs {
 		prefix := fmt.Sprintf("jobs[%d]", i)
@@ -1039,7 +1278,16 @@ func (c config) validate() error {
 		case "database_dump":
 			needsDatabase = true
 			problems = appendRetentionProblems(problems, prefix+".retention", job.Retention)
-			problems = appendDatabaseJobProblems(problems, prefix, job)
+			problems = appendDatabaseJobProblems(problems, prefix, job, len(c.Database) > 1)
+			if selectedName := strings.TrimSpace(job.DatabaseConfig); selectedName != "" {
+				if _, ok := databaseNames[selectedName]; !ok {
+					problems = append(problems, fmt.Sprintf("%s.database_config %q does not match any configured database", prefix, selectedName))
+				}
+			}
+
+			if database, _, err := c.resolveDatabaseConfig(job); err == nil && database.resticEnabled(c.Restic) {
+				needsRestic = true
+			}
 		case "restic_backup":
 			needsRestic = true
 			if len(job.Sources) == 0 {
@@ -1060,12 +1308,8 @@ func (c config) validate() error {
 
 	}
 
-	if needsDatabase && c.databaseResticEnabled() {
-		needsRestic = true
-	}
-
-	if needsDatabase && strings.TrimSpace(c.Database.DumpTool) == "" {
-		problems = append(problems, "database.dump_tool is required when database_dump jobs are configured")
+	if needsDatabase && len(c.Database) == 0 {
+		problems = append(problems, "database must define at least one config when database_dump jobs are configured")
 	}
 
 	if needsRestic {
@@ -1084,7 +1328,10 @@ func (c config) validate() error {
 	return nil
 }
 
-func appendDatabaseJobProblems(problems []string, prefix string, job jobConfig) []string {
+func appendDatabaseJobProblems(problems []string, prefix string, job jobConfig, requireDatabaseConfig bool) []string {
+	if requireDatabaseConfig && strings.TrimSpace(job.DatabaseConfig) == "" {
+		problems = append(problems, prefix+".database_config is required when multiple database configs are defined")
+	}
 	if strings.TrimSpace(job.DatabaseName) == "" {
 		problems = append(problems, prefix+".database_name is required")
 	}
@@ -1106,6 +1353,26 @@ func appendDatabaseJobProblems(problems []string, prefix string, job jobConfig) 
 	return problems
 }
 
+func appendDatabaseConfigProblems(problems []string, prefix string, database databaseConfig) []string {
+	if _, err := resolveDatabaseDumpSpec(database); err != nil {
+		if strings.TrimSpace(database.Type) != "" {
+			problems = append(problems, fmt.Sprintf("%s.type must be one of %q, %q, or %q", prefix, databaseConfigTypeMySQL, databaseConfigTypeMariaDB, databaseConfigTypePostgres))
+		} else {
+			problems = append(problems, prefix+".type is required")
+		}
+	}
+
+	return problems
+}
+
+func databaseConfigValidationPrefix(index, total int) string {
+	if total == 1 {
+		return "database"
+	}
+
+	return fmt.Sprintf("database[%d]", index)
+}
+
 func checkRuntimeDependencies(cfg config, jobs []jobConfig, requireRestic bool) error {
 	var problems []string
 
@@ -1113,8 +1380,29 @@ func checkRuntimeDependencies(cfg config, jobs []jobConfig, requireRestic bool) 
 		problems = appendBinaryAvailabilityProblem(problems, "restic.binary", cfg.Restic.Binary)
 	}
 
-	if hasJobType(jobs, "database_dump") {
-		problems = appendBinaryAvailabilityProblem(problems, "database.dump_tool", cfg.Database.DumpTool)
+	checkedDatabaseConfigs := make(map[string]struct{}, len(cfg.Database))
+	for _, job := range jobs {
+		if job.Type != "database_dump" {
+			continue
+		}
+
+		database, configName, err := cfg.resolveDatabaseConfig(job)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+		if _, ok := checkedDatabaseConfigs[configName]; ok {
+			continue
+		}
+		spec, err := resolveDatabaseDumpSpec(database)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+
+		label := databaseBinaryLabel(configName, len(cfg.Database))
+		problems = appendBinaryAvailabilityProblem(problems, label, spec.binary)
+		checkedDatabaseConfigs[configName] = struct{}{}
 	}
 
 	if len(problems) > 0 {
@@ -1129,7 +1417,26 @@ func requireResticForJobs(cfg config, jobs []jobConfig) bool {
 		return true
 	}
 
-	return hasJobType(jobs, "database_dump") && cfg.databaseResticEnabled()
+	for _, job := range jobs {
+		if job.Type != "database_dump" {
+			continue
+		}
+
+		useRestic, err := cfg.databaseResticEnabledForJob(job)
+		if err == nil && useRestic {
+			return true
+		}
+	}
+
+	return false
+}
+
+func databaseBinaryLabel(configName string, total int) string {
+	if total == 1 && configName == defaultDatabaseConfigName {
+		return "database.binary"
+	}
+
+	return fmt.Sprintf("database[%s].binary", configName)
 }
 
 func appendBinaryAvailabilityProblem(problems []string, label, binary string) []string {
@@ -1366,6 +1673,12 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 		return fmt.Errorf("required environment variable %s is not set", database.PasswordEnv)
 	}
 
+	invocation, err := prepareDatabaseDumpInvocation(database, password)
+	if err != nil {
+		return err
+	}
+	defer invocation.cleanup()
+
 	outputDir := databaseDumpOutputDir(job)
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return fmt.Errorf("create dump output dir %s: %w", outputDir, err)
@@ -1375,13 +1688,7 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 	fileName := databaseDumpFileName(job.Name, database.Gzip, now)
 	outputPath := filepath.Join(outputDir, fileName)
 
-	defaultsFilePath, err := createMySQLDefaultsFile(database, password)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(defaultsFilePath)
-
-	if err := r.runDatabaseDumpWithRetry(ctx, job.Name, database, defaultsFilePath, outputPath); err != nil {
+	if err := r.runDatabaseDumpWithRetry(ctx, job.Name, database, invocation, outputPath); err != nil {
 		return err
 	}
 
@@ -1393,7 +1700,7 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 		}
 	}
 
-	if r.cfg.databaseResticEnabled() {
+	if database.ResticEnabled {
 		if err := r.runDatabaseDumpResticBackup(ctx, job, outputDir); err != nil {
 			return err
 		}
@@ -1402,12 +1709,12 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 	return nil
 }
 
-func (r *templateRunner) runDatabaseDumpWithRetry(ctx context.Context, jobName string, database resolvedDatabaseDumpConfig, defaultsFilePath, outputPath string) error {
+func (r *templateRunner) runDatabaseDumpWithRetry(ctx context.Context, jobName string, database resolvedDatabaseDumpConfig, invocation databaseDumpInvocation, outputPath string) error {
 	totalAttempts := len(databaseDumpRetryBackoff) + 1
 	var lastErr error
 
 	for attempt := 1; attempt <= totalAttempts; attempt++ {
-		err := r.runDatabaseDumpCommand(ctx, database, defaultsFilePath, outputPath)
+		err := r.runDatabaseDumpCommand(ctx, database, invocation, outputPath)
 		if err == nil {
 			return nil
 		}
@@ -1427,7 +1734,7 @@ func (r *templateRunner) runDatabaseDumpWithRetry(ctx context.Context, jobName s
 	return lastErr
 }
 
-func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database resolvedDatabaseDumpConfig, defaultsFilePath, outputPath string) error {
+func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database resolvedDatabaseDumpConfig, invocation databaseDumpInvocation, outputPath string) error {
 	outputFile, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create dump file %s: %w", outputPath, err)
@@ -1451,9 +1758,8 @@ func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database re
 		return runErr
 	}
 
-	args := buildDatabaseDumpArgs(defaultsFilePath, database)
-	cmd := exec.CommandContext(ctx, database.DumpTool, args...)
-	cmd.Env = os.Environ()
+	cmd := exec.CommandContext(ctx, database.DumpTool, invocation.args...)
+	cmd.Env = mergeEnv(os.Environ(), invocation.envAdditions)
 	cmd.Stdout = writer
 
 	var stderr bytes.Buffer
@@ -1462,10 +1768,10 @@ func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database re
 	if err := cmd.Run(); err != nil {
 		message := strings.TrimSpace(stderr.String())
 		if message != "" {
-			return cleanupOnError(fmt.Errorf("%s %s: %w: %s", database.DumpTool, strings.Join(args, " "), err, message))
+			return cleanupOnError(fmt.Errorf("%s %s: %w: %s", database.DumpTool, strings.Join(invocation.args, " "), err, message))
 		}
 
-		return cleanupOnError(fmt.Errorf("%s %s: %w", database.DumpTool, strings.Join(args, " "), err))
+		return cleanupOnError(fmt.Errorf("%s %s: %w", database.DumpTool, strings.Join(invocation.args, " "), err))
 	}
 
 	if err := writer.Close(); err != nil {
@@ -1671,17 +1977,31 @@ func (r *templateRunner) runCommand(ctx context.Context, jobName, binary string,
 }
 
 func (r *templateRunner) resolveDatabaseDumpConfig(job jobConfig) (resolvedDatabaseDumpConfig, error) {
+	databaseConfig, configName, err := r.cfg.resolveDatabaseConfig(job)
+	if err != nil {
+		return resolvedDatabaseDumpConfig{}, err
+	}
+
+	spec, err := resolveDatabaseDumpSpec(databaseConfig)
+	if err != nil {
+		return resolvedDatabaseDumpConfig{}, fmt.Errorf("resolve database config %s: %w", configName, err)
+	}
+
 	return resolvedDatabaseDumpConfig{
+		ConfigName:    configName,
+		ConfigType:    spec.configType,
 		Name:          strings.TrimSpace(job.DatabaseName),
-		DumpTool:      r.cfg.Database.DumpTool,
+		DumpTool:      spec.binary,
+		DumpKind:      spec.kind,
 		Host:          job.Host,
 		Port:          job.Port,
 		User:          job.User,
 		PasswordEnv:   job.Password,
 		Tables:        append([]string(nil), job.Tables...),
 		ExcludeTables: append([]string(nil), job.ExcludeTables...),
-		DumpFlags:     append([]string(nil), r.cfg.Database.DumpFlags...),
-		Gzip:          r.cfg.Database.Gzip,
+		DumpFlags:     append([]string(nil), spec.flags...),
+		Gzip:          databaseConfig.Gzip,
+		ResticEnabled: databaseConfig.resticEnabled(r.cfg.Restic),
 	}, nil
 }
 
@@ -1728,6 +2048,36 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+type databaseDumpInvocation struct {
+	args         []string
+	envAdditions []string
+	cleanup      func()
+}
+
+func prepareDatabaseDumpInvocation(database resolvedDatabaseDumpConfig, password string) (databaseDumpInvocation, error) {
+	invocation := databaseDumpInvocation{
+		cleanup: func() {},
+	}
+
+	switch database.DumpKind {
+	case databaseDumpKindPostgres:
+		invocation.args = buildPostgresDumpArgs(database)
+		invocation.envAdditions = []string{postgresPasswordEnv + "=" + password}
+		return invocation, nil
+	default:
+		defaultsFilePath, err := createMySQLDefaultsFile(database, password)
+		if err != nil {
+			return databaseDumpInvocation{}, err
+		}
+
+		invocation.args = buildMySQLDumpArgs(defaultsFilePath, database)
+		invocation.cleanup = func() {
+			_ = os.Remove(defaultsFilePath)
+		}
+		return invocation, nil
+	}
+}
+
 func createMySQLDefaultsFile(database resolvedDatabaseDumpConfig, password string) (string, error) {
 	file, err := os.CreateTemp("", "backuper-mysql-*.cnf")
 	if err != nil {
@@ -1750,7 +2100,7 @@ func createMySQLDefaultsFile(database resolvedDatabaseDumpConfig, password strin
 	return file.Name(), nil
 }
 
-func buildDatabaseDumpArgs(defaultsFilePath string, database resolvedDatabaseDumpConfig) []string {
+func buildMySQLDumpArgs(defaultsFilePath string, database resolvedDatabaseDumpConfig) []string {
 	args := []string{"--defaults-extra-file=" + defaultsFilePath}
 	args = append(args, database.DumpFlags...)
 	for _, table := range database.ExcludeTables {
@@ -1758,6 +2108,22 @@ func buildDatabaseDumpArgs(defaultsFilePath string, database resolvedDatabaseDum
 	}
 	args = append(args, database.Name)
 	args = append(args, database.Tables...)
+	return args
+}
+
+func buildPostgresDumpArgs(database resolvedDatabaseDumpConfig) []string {
+	args := append([]string(nil), database.DumpFlags...)
+	args = append(args, "-h", database.Host)
+	args = append(args, "-p", strconv.Itoa(database.Port))
+	args = append(args, "-U", database.User)
+	args = append(args, "-d", database.Name)
+	for _, table := range database.Tables {
+		args = append(args, "-t", table)
+	}
+	for _, table := range database.ExcludeTables {
+		args = append(args, "-T", table)
+	}
+
 	return args
 }
 

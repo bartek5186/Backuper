@@ -26,8 +26,7 @@ func TestLoadConfigSupportsDatabaseDefaultsAndJobSpecificConnections(t *testing.
     "timezone": "Europe/Warsaw"
   },
   "database": {
-    "dump_tool": "mariadb-dump",
-    "dump_flags": ["--single-transaction", "--quick"],
+    "type": "mariadb",
     "gzip": true
   },
   "restic": {
@@ -63,6 +62,63 @@ func TestLoadConfigSupportsDatabaseDefaultsAndJobSpecificConnections(t *testing.
 
 	if _, err := loadConfig(path); err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
+	}
+}
+
+func TestLoadConfigSupportsNamedDatabaseConfigs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	content := `{
+  "app": {
+    "name": "backuper",
+    "timezone": "Europe/Warsaw"
+  },
+  "database": [
+    {
+      "name": "mysql",
+      "type": "mariadb",
+      "gzip": true
+    },
+    {
+      "name": "postgres",
+      "type": "postgres",
+      "gzip": false
+    }
+  ],
+  "jobs": [
+    {
+      "name": "db_app_main_dump",
+      "type": "database_dump",
+      "schedule": "0 2 * * *",
+      "timeout_minutes": 90,
+      "database_config": "postgres",
+      "database_name": "myapp",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "user": "backup_user",
+      "password": "BACKUP_DB_PASSWORD"
+    }
+  ]
+}`
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+
+	if len(cfg.Database) != 2 {
+		t.Fatalf("expected 2 database configs, got %d", len(cfg.Database))
+	}
+	if cfg.Database[1].Name != "postgres" {
+		t.Fatalf("unexpected second database config: %#v", cfg.Database[1])
+	}
+	if cfg.Jobs[0].DatabaseConfig != "postgres" {
+		t.Fatalf("unexpected job database_config: %q", cfg.Jobs[0].DatabaseConfig)
 	}
 }
 
@@ -112,9 +168,7 @@ func TestValidateRejectsMissingDatabaseFieldsInDumpJob(t *testing.T) {
 			Name:     "backuper",
 			Timezone: "Europe/Warsaw",
 		},
-		Database: databaseDefaultsConfig{
-			DumpTool: "mariadb-dump",
-		},
+		Database: databaseConfigList{{Type: "mariadb"}},
 		Jobs: []jobConfig{
 			{
 				Name:           "db_missing",
@@ -149,9 +203,7 @@ func TestValidateAllowsDatabaseDumpWithGlobalDefaults(t *testing.T) {
 			Name:     "backuper",
 			Timezone: "Europe/Warsaw",
 		},
-		Database: databaseDefaultsConfig{
-			DumpTool: "mariadb-dump",
-		},
+		Database: databaseConfigList{{Type: "mariadb"}},
 		Jobs: []jobConfig{
 			{
 				Name:           "db_dump",
@@ -170,6 +222,75 @@ func TestValidateAllowsDatabaseDumpWithGlobalDefaults(t *testing.T) {
 
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() error = %v", err)
+	}
+}
+
+func TestValidateRequiresDatabaseConfigWhenMultipleDatabaseConfigsExist(t *testing.T) {
+	cfg := config{
+		App: appConfig{
+			Name:     "backuper",
+			Timezone: "Europe/Warsaw",
+		},
+		Database: databaseConfigList{
+			{Name: "mysql", Type: "mysql"},
+			{Name: "postgres", Type: "postgres"},
+		},
+		Jobs: []jobConfig{
+			{
+				Name:           "db_dump",
+				Type:           "database_dump",
+				Schedule:       "0 2 * * *",
+				TimeoutMinutes: 90,
+				DatabaseName:   "myapp",
+				Host:           "127.0.0.1",
+				Port:           3306,
+				User:           "backup_user",
+				Password:       "BACKUP_DB_PASSWORD",
+			},
+		},
+	}
+
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() returned nil error for missing database_config")
+	}
+
+	if !strings.Contains(err.Error(), "database_config is required when multiple database configs are defined") {
+		t.Fatalf("expected database_config validation error, got %v", err)
+	}
+}
+
+func TestValidateRejectsUnsupportedDatabaseType(t *testing.T) {
+	cfg := config{
+		App: appConfig{
+			Name:     "backuper",
+			Timezone: "Europe/Warsaw",
+		},
+		Database: databaseConfigList{
+			{Type: "oracle"},
+		},
+		Jobs: []jobConfig{
+			{
+				Name:           "db_dump",
+				Type:           "database_dump",
+				Schedule:       "0 2 * * *",
+				TimeoutMinutes: 90,
+				DatabaseName:   "myapp",
+				Host:           "127.0.0.1",
+				Port:           3306,
+				User:           "backup_user",
+				Password:       "BACKUP_DB_PASSWORD",
+			},
+		},
+	}
+
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() returned nil error for unsupported database type")
+	}
+
+	if !strings.Contains(err.Error(), `database.type must be one of "mysql", "mariadb", or "postgres"`) {
+		t.Fatalf("expected unsupported database type error, got %v", err)
 	}
 }
 
@@ -210,9 +331,7 @@ func TestValidateAllowsRetentionForDatabaseDump(t *testing.T) {
 			Name:     "backuper",
 			Timezone: "Europe/Warsaw",
 		},
-		Database: databaseDefaultsConfig{
-			DumpTool: "mariadb-dump",
-		},
+		Database: databaseConfigList{{Type: "mariadb"}},
 		Jobs: []jobConfig{
 			{
 				Name:           "db_app_main_dump",
@@ -243,9 +362,7 @@ func TestValidateRejectsRetentionDays(t *testing.T) {
 			Name:     "backuper",
 			Timezone: "Europe/Warsaw",
 		},
-		Database: databaseDefaultsConfig{
-			DumpTool: "mariadb-dump",
-		},
+		Database: databaseConfigList{{Type: "mariadb"}},
 		Jobs: []jobConfig{
 			{
 				Name:           "db_app_main_dump",
@@ -274,9 +391,7 @@ func TestValidateRejectsRetentionDays(t *testing.T) {
 
 func TestCheckRuntimeDependenciesRejectsMissingBinaries(t *testing.T) {
 	cfg := config{
-		Database: databaseDefaultsConfig{
-			DumpTool: "/tmp/definitely-missing-dump-tool",
-		},
+		Database: databaseConfigList{{DumpTool: "/tmp/definitely-missing-dump-tool"}},
 		Restic: resticConfig{
 			Binary: "/tmp/definitely-missing-restic",
 		},
@@ -301,18 +416,18 @@ func TestCheckRuntimeDependenciesRejectsMissingBinaries(t *testing.T) {
 	if !strings.Contains(err.Error(), "restic.binary") {
 		t.Fatalf("expected restic binary error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "database.dump_tool") {
-		t.Fatalf("expected dump tool error, got %v", err)
+	if !strings.Contains(err.Error(), "database.binary") {
+		t.Fatalf("expected dump binary error, got %v", err)
 	}
 }
 
 func TestCheckRuntimeDependenciesRequiresResticForDatabaseDumpWhenEnabled(t *testing.T) {
 	enabled := true
 	cfg := config{
-		Database: databaseDefaultsConfig{
-			DumpTool: "mariadb-dump",
-			Restic:   &enabled,
-		},
+		Database: databaseConfigList{{
+			Type:   "mariadb",
+			Restic: &enabled,
+		}},
 		Restic: resticConfig{
 			Binary: "/tmp/definitely-missing-restic",
 		},
@@ -632,14 +747,16 @@ printf '%s\n' '[{"id":"dbsnap","time":"` + now.Add(-90*time.Minute).Format(time.
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
+	enabled := true
 	runner := newTemplateRunner(config{
+		Database: databaseConfigList{{Type: "mariadb", Restic: &enabled}},
 		Restic: resticConfig{
 			Binary:     binaryPath,
 			Repository: "/tmp/restic-repo",
 		},
 	}, os.Stdout, os.Stderr)
 	jobs := []jobConfig{
-		{Name: "db_job", Type: "database_dump"},
+		{Name: "db_job", Type: "database_dump", DatabaseName: "myapp", Host: "127.0.0.1", Port: 3306, User: "backup_user", Password: "BACKUP_DB_PASSWORD"},
 		{
 			Name:           "restic_job",
 			Type:           "restic_backup",
@@ -962,7 +1079,7 @@ func TestRunDatabaseDumpJobCreatesDumpAndAppliesRetention(t *testing.T) {
 		_ = os.Chdir(previousWD)
 	})
 
-	binaryPath := filepath.Join(dir, "fake-dump.sh")
+	binaryPath := filepath.Join(dir, "mariadb-dump")
 	script := `#!/usr/bin/env bash
 set -eu
 printf '%s\n' 'dump-content'
@@ -970,6 +1087,7 @@ printf '%s\n' 'dump-content'
 	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	t.Setenv("BACKUP_DB_PASSWORD", "secret")
 
@@ -987,10 +1105,10 @@ printf '%s\n' 'dump-content'
 	}
 
 	runner := newTemplateRunner(config{
-		Database: databaseDefaultsConfig{
-			DumpTool: binaryPath,
-			Gzip:     true,
-		},
+		Database: databaseConfigList{{
+			Type: "mariadb",
+			Gzip: true,
+		}},
 	}, os.Stdout, os.Stderr)
 
 	job := jobConfig{
@@ -1062,7 +1180,7 @@ func TestRunDatabaseDumpJobRetriesTemporaryFailures(t *testing.T) {
 	attemptsPath := filepath.Join(dir, "attempts.txt")
 	t.Setenv("TEST_DUMP_ATTEMPTS_FILE", attemptsPath)
 
-	binaryPath := filepath.Join(dir, "fake-dump.sh")
+	binaryPath := filepath.Join(dir, "mariadb-dump")
 	script := `#!/usr/bin/env bash
 set -eu
 attempt_file="${TEST_DUMP_ATTEMPTS_FILE}"
@@ -1083,14 +1201,15 @@ printf '%s\n' 'dump-content'
 	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	t.Setenv("BACKUP_DB_PASSWORD", "secret")
 
 	runner := newTemplateRunner(config{
-		Database: databaseDefaultsConfig{
-			DumpTool: binaryPath,
-			Gzip:     false,
-		},
+		Database: databaseConfigList{{
+			Type: "mariadb",
+			Gzip: false,
+		}},
 	}, os.Stdout, os.Stderr)
 
 	var gotSleeps []time.Duration
@@ -1151,6 +1270,106 @@ printf '%s\n' 'dump-content'
 	}
 }
 
+func TestRunDatabaseDumpJobUsesSelectedPostgresConfig(t *testing.T) {
+	dir := t.TempDir()
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousWD)
+	})
+
+	argsPath := filepath.Join(dir, "args.txt")
+	passwordPath := filepath.Join(dir, "pgpassword.txt")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	t.Setenv("TEST_PGPASSWORD_FILE", passwordPath)
+
+	binaryPath := filepath.Join(dir, "pg_dump")
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" > "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+printf '%s' "${PGPASSWORD:-}" > "$TEST_PGPASSWORD_FILE"
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+
+	runner := newTemplateRunner(config{
+		Database: databaseConfigList{
+			{Name: "mysql", Type: "mariadb", Gzip: true},
+			{Name: "postgres", Type: "postgres", Gzip: false},
+		},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "db_job",
+		Type:           "database_dump",
+		Schedule:       "0 2 * * *",
+		TimeoutMinutes: 90,
+		DatabaseConfig: "postgres",
+		DatabaseName:   "myapp",
+		Host:           "127.0.0.1",
+		Port:           5432,
+		User:           "backup_user",
+		Password:       "BACKUP_DB_PASSWORD",
+		Tables:         []string{"users"},
+		ExcludeTables:  []string{"sessions"},
+	}
+
+	if err := runner.runDatabaseDumpJob(context.Background(), job); err != nil {
+		t.Fatalf("runDatabaseDumpJob() error = %v", err)
+	}
+
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	gotArgs := strings.Fields(strings.TrimSpace(string(argsBytes)))
+	wantArgs := []string{"--clean", "--if-exists", "-h", "127.0.0.1", "-p", "5432", "-U", "backup_user", "-d", "myapp", "-t", "users", "-T", "sessions"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("unexpected pg_dump args: got %#v, want %#v", gotArgs, wantArgs)
+	}
+	for i := range wantArgs {
+		if gotArgs[i] != wantArgs[i] {
+			t.Fatalf("unexpected pg_dump args: got %#v, want %#v", gotArgs, wantArgs)
+		}
+	}
+
+	passwordBytes, err := os.ReadFile(passwordPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.TrimSpace(string(passwordBytes)) != "secret" {
+		t.Fatalf("unexpected PGPASSWORD: %q", string(passwordBytes))
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, "backups", "db_job"))
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 dump file, got %d", len(entries))
+	}
+
+	dumpPath := filepath.Join(dir, "backups", "db_job", entries[0].Name())
+	content, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.TrimSpace(string(content)) != "dump-content" {
+		t.Fatalf("unexpected dump content: %q", string(content))
+	}
+}
+
 func TestRunDatabaseDumpJobAlsoCreatesResticBackupWhenEnabled(t *testing.T) {
 	dir := t.TempDir()
 	previousWD, err := os.Getwd()
@@ -1164,7 +1383,7 @@ func TestRunDatabaseDumpJobAlsoCreatesResticBackupWhenEnabled(t *testing.T) {
 		_ = os.Chdir(previousWD)
 	})
 
-	dumpBinaryPath := filepath.Join(dir, "fake-dump.sh")
+	dumpBinaryPath := filepath.Join(dir, "mariadb-dump")
 	dumpScript := `#!/usr/bin/env bash
 set -eu
 printf '%s\n' 'dump-content'
@@ -1172,6 +1391,7 @@ printf '%s\n' 'dump-content'
 	if err := os.WriteFile(dumpBinaryPath, []byte(dumpScript), 0o755); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	argsPath := filepath.Join(dir, "restic-args.txt")
 	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
@@ -1189,10 +1409,10 @@ printf '\n' >> "$TEST_ARGS_FILE"
 	t.Setenv(resticPasswordEnv, "restic-secret")
 
 	runner := newTemplateRunner(config{
-		Database: databaseDefaultsConfig{
-			DumpTool: dumpBinaryPath,
-			Gzip:     true,
-		},
+		Database: databaseConfigList{{
+			Type: "mariadb",
+			Gzip: true,
+		}},
 		Restic: resticConfig{
 			Binary:     resticBinaryPath,
 			Repository: "/tmp/restic-repo",
