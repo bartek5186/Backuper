@@ -12,7 +12,8 @@
       "--triggers",
       "--events"
     ],
-    "gzip": true
+    "gzip": true,
+    "restic": true
   },
   "restic": {
     "binary": "/usr/bin/restic",
@@ -29,7 +30,10 @@
       "port": 3306,
       "user": "backup_user",
       "password": "APP_MAIN_DB_PASSWORD",
-      "retention_days": 7
+      "retention": {
+        "keep_hourly": 3,
+        "keep_daily": 14
+      }
     },
     {
       "name": "db_billing_dump",
@@ -41,21 +45,8 @@
       "port": 3306,
       "user": "backup_user",
       "password": "BILLING_DB_PASSWORD",
-      "retention_days": 7
-    },
-    {
-      "name": "restic_db",
-      "type": "restic_backup",
-      "schedule": "30 2 * * *",
-      "timeout_minutes": 180,
-      "sources": [
-        "./backups/db_app_main_dump",
-        "./backups/db_billing_dump"
-      ],
-      "tags": [
-        "db"
-      ],
       "retention": {
+        "keep_hourly": 3,
         "keep_daily": 14
       }
     },

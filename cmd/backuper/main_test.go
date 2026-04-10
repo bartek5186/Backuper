@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -202,7 +204,7 @@ func TestValidateAllowsJobLevelRetentionForResticBackup(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsRetentionForDatabaseDump(t *testing.T) {
+func TestValidateAllowsRetentionForDatabaseDump(t *testing.T) {
 	cfg := config{
 		App: appConfig{
 			Name:     "backuper",
@@ -223,39 +225,38 @@ func TestValidateRejectsRetentionForDatabaseDump(t *testing.T) {
 				User:           "backup_user",
 				Password:       "BACKUP_DB_PASSWORD",
 				Retention: &jobRetentionConfig{
-					KeepDaily: 14,
+					KeepHourly: 3,
+					KeepDaily:  14,
 				},
 			},
 		},
 	}
 
-	err := cfg.validate()
-	if err == nil {
-		t.Fatal("validate() returned nil error for database_dump retention")
-	}
-
-	if !strings.Contains(err.Error(), "retention is only supported for restic_backup jobs") {
-		t.Fatalf("expected retention error, got %v", err)
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() error = %v", err)
 	}
 }
 
-func TestValidateRejectsRetentionDaysForResticBackup(t *testing.T) {
+func TestValidateRejectsRetentionDays(t *testing.T) {
 	cfg := config{
 		App: appConfig{
 			Name:     "backuper",
 			Timezone: "Europe/Warsaw",
 		},
-		Restic: resticConfig{
-			Binary:     "/usr/bin/restic",
-			Repository: "sftp://backup@example//repo",
+		Database: databaseDefaultsConfig{
+			DumpTool: "mariadb-dump",
 		},
 		Jobs: []jobConfig{
 			{
-				Name:           "restic_uploads",
-				Type:           "restic_backup",
-				Schedule:       "15 * * * *",
-				TimeoutMinutes: 180,
-				Sources:        []string{"/data/A"},
+				Name:           "db_app_main_dump",
+				Type:           "database_dump",
+				Schedule:       "0 2 * * *",
+				TimeoutMinutes: 90,
+				DatabaseName:   "myapp",
+				Host:           "127.0.0.1",
+				Port:           3306,
+				User:           "backup_user",
+				Password:       "BACKUP_DB_PASSWORD",
 				RetentionDays:  7,
 			},
 		},
@@ -263,11 +264,11 @@ func TestValidateRejectsRetentionDaysForResticBackup(t *testing.T) {
 
 	err := cfg.validate()
 	if err == nil {
-		t.Fatal("validate() returned nil error for restic retention_days")
+		t.Fatal("validate() returned nil error for retention_days")
 	}
 
-	if !strings.Contains(err.Error(), "retention_days is only supported for database_dump jobs") {
-		t.Fatalf("expected retention_days error, got %v", err)
+	if !strings.Contains(err.Error(), "retention_days is no longer supported") {
+		t.Fatalf("expected deprecated retention_days error, got %v", err)
 	}
 }
 
@@ -302,6 +303,35 @@ func TestCheckRuntimeDependenciesRejectsMissingBinaries(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "database.dump_tool") {
 		t.Fatalf("expected dump tool error, got %v", err)
+	}
+}
+
+func TestCheckRuntimeDependenciesRequiresResticForDatabaseDumpWhenEnabled(t *testing.T) {
+	enabled := true
+	cfg := config{
+		Database: databaseDefaultsConfig{
+			DumpTool: "mariadb-dump",
+			Restic:   &enabled,
+		},
+		Restic: resticConfig{
+			Binary: "/tmp/definitely-missing-restic",
+		},
+	}
+
+	jobs := []jobConfig{
+		{
+			Name: "db_job",
+			Type: "database_dump",
+		},
+	}
+
+	err := checkRuntimeDependencies(cfg, jobs, requireResticForJobs(cfg, jobs))
+	if err == nil {
+		t.Fatal("checkRuntimeDependencies() returned nil error for missing restic on database_dump")
+	}
+
+	if !strings.Contains(err.Error(), "restic.binary") {
+		t.Fatalf("expected restic binary error, got %v", err)
 	}
 }
 
@@ -560,6 +590,190 @@ func TestHandleResticSnapshotsRejectsNonGET(t *testing.T) {
 	}
 }
 
+func TestHandleHealthReturnsJobsWithBackupStatus(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "secret")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	dir := t.TempDir()
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousWD)
+	})
+
+	dumpDir := filepath.Join(dir, "backups", "db_job")
+	if err := os.MkdirAll(dumpDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	dumpPath := filepath.Join(dumpDir, "db_job_2026-04-10_12-00-00.sql.gz")
+	dumpTime := now.Add(-2 * time.Hour)
+	if err := os.WriteFile(dumpPath, []byte("dump"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chtimes(dumpPath, dumpTime, dumpTime); err != nil {
+		t.Fatalf("Chtimes() error = %v", err)
+	}
+
+	argsPath := filepath.Join(dir, "args.txt")
+	binaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+printf '%s\n' '[{"id":"dbsnap","time":"` + now.Add(-90*time.Minute).Format(time.RFC3339) + `","tags":["db_job"],"paths":["/tmp/ignored"]},{"id":"snap1","time":"` + now.Add(-time.Hour).Format(time.RFC3339) + `","tags":["uploads"],"paths":["/tmp/ignored"]}]'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     binaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+	jobs := []jobConfig{
+		{Name: "db_job", Type: "database_dump"},
+		{
+			Name:           "restic_job",
+			Type:           "restic_backup",
+			Sources:        []string{"/data/uploads"},
+			Tags:           []string{"uploads"},
+			Schedule:       "0 * * * *",
+			TimeoutMinutes: 60,
+		},
+	}
+
+	server := newAPIServerWithRunner(runner, jobs, os.Stdout, os.Stderr)
+	request := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	recorder := httptest.NewRecorder()
+
+	server.handleHealth(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response healthResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	if len(response.Jobs) != 2 {
+		t.Fatalf("unexpected job count: %#v", response.Jobs)
+	}
+	if response.Jobs[0].Name != "db_job" || !response.Jobs[0].Healthy || response.Jobs[0].LastSuccessAt == nil {
+		t.Fatalf("unexpected first job status: %#v", response.Jobs[0])
+	}
+	if !response.Jobs[0].LastSuccessAt.UTC().Equal(now.Add(-90 * time.Minute)) {
+		t.Fatalf("unexpected db last success: %#v", response.Jobs[0].LastSuccessAt)
+	}
+	if response.Jobs[1].Name != "restic_job" || !response.Jobs[1].Healthy || response.Jobs[1].LastSuccessAt == nil {
+		t.Fatalf("unexpected second job status: %#v", response.Jobs[1])
+	}
+	if !response.Jobs[1].LastSuccessAt.UTC().Equal(now.Add(-time.Hour)) {
+		t.Fatalf("unexpected restic last success: %#v", response.Jobs[1].LastSuccessAt)
+	}
+	if response.Jobs[0].Error != "" || response.Jobs[1].Error != "" {
+		t.Fatalf("unexpected errors in health response: %#v", response.Jobs)
+	}
+
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	args := strings.Fields(string(argsBytes))
+	expectedArgs := []string{"-r", "/tmp/restic-repo", "snapshots", "--json"}
+	if len(args) != len(expectedArgs) {
+		t.Fatalf("unexpected restic args: got %#v, want %#v", args, expectedArgs)
+	}
+	for i := range expectedArgs {
+		if args[i] != expectedArgs[i] {
+			t.Fatalf("unexpected restic args: got %#v, want %#v", args, expectedArgs)
+		}
+	}
+}
+
+func TestHandleHealthReturnsFalseForStaleSnapshots(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "secret")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args.txt")
+	binaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+printf '%s\n' '[{"id":"snap1","time":"` + now.Add(-25*time.Hour).Format(time.RFC3339) + `","tags":["uploads"],"paths":["/data/uploads"]}]'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     binaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+	jobs := []jobConfig{
+		{
+			Name:           "restic_job",
+			Type:           "restic_backup",
+			Sources:        []string{"/data/uploads"},
+			Tags:           []string{"uploads"},
+			Schedule:       "0 * * * *",
+			TimeoutMinutes: 60,
+		},
+	}
+
+	server := newAPIServerWithRunner(runner, jobs, os.Stdout, os.Stderr)
+	request := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	recorder := httptest.NewRecorder()
+
+	server.handleHealth(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response healthResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	if len(response.Jobs) != 1 {
+		t.Fatalf("unexpected job count: %#v", response.Jobs)
+	}
+	if response.Jobs[0].Healthy {
+		t.Fatalf("expected stale snapshot to be unhealthy: %#v", response.Jobs[0])
+	}
+	if response.Jobs[0].LastSuccessAt == nil {
+		t.Fatalf("expected stale snapshot timestamp to be present: %#v", response.Jobs[0])
+	}
+}
+
+func TestHandleHealthRejectsNonGET(t *testing.T) {
+	server := newAPIServer(config{}, os.Stdout, os.Stderr)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/health", nil)
+	recorder := httptest.NewRecorder()
+
+	server.handleHealth(recorder, request)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("unexpected status code: got %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+	}
+}
+
 func TestSelectLatestResticSnapshotChoosesNewestByTime(t *testing.T) {
 	snapshots := []resticSnapshotSummary{
 		{ID: "old", Time: time.Date(2026, time.April, 10, 12, 0, 0, 0, time.UTC)},
@@ -652,7 +866,90 @@ exit 0
 	}
 }
 
-func TestRunDatabaseDumpJobCreatesDumpAndPrunesOldFiles(t *testing.T) {
+func TestResticOperationsAreSerialized(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "secret")
+
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "fake-restic.sh")
+	lockPath := filepath.Join(dir, "restic.lock")
+	maxPath := filepath.Join(dir, "max.txt")
+	t.Setenv("TEST_RESTIC_LOCK_FILE", lockPath)
+	t.Setenv("TEST_RESTIC_MAX_FILE", maxPath)
+
+	script := `#!/usr/bin/env bash
+set -eu
+lock_file="${TEST_RESTIC_LOCK_FILE}"
+max_file="${TEST_RESTIC_MAX_FILE}"
+
+count=0
+if [ -f "$lock_file" ]; then
+  count=$(cat "$lock_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$lock_file"
+
+max_seen=0
+if [ -f "$max_file" ]; then
+  max_seen=$(cat "$max_file")
+fi
+if [ "$count" -gt "$max_seen" ]; then
+  printf '%s' "$count" > "$max_file"
+fi
+
+sleep 1
+
+count=$(cat "$lock_file")
+count=$((count - 1))
+printf '%s' "$count" > "$lock_file"
+
+printf '%s\n' '[]'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     binaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := runner.listResticSnapshotSummaries(context.Background(), nil)
+			errCh <- err
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("listResticSnapshotSummaries() error = %v", err)
+		}
+	}
+
+	maxBytes, err := os.ReadFile(maxPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	maxSeen, err := strconv.Atoi(strings.TrimSpace(string(maxBytes)))
+	if err != nil {
+		t.Fatalf("Atoi() error = %v", err)
+	}
+	if maxSeen != 1 {
+		t.Fatalf("expected serialized restic access, max concurrency = %d", maxSeen)
+	}
+}
+
+func TestRunDatabaseDumpJobCreatesDumpAndAppliesRetention(t *testing.T) {
 	dir := t.TempDir()
 	previousWD, err := os.Getwd()
 	if err != nil {
@@ -684,7 +981,7 @@ printf '%s\n' 'dump-content'
 	if err := os.WriteFile(oldFile, []byte("old"), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	oldTime := time.Now().AddDate(0, 0, -10)
+	oldTime := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(oldFile, oldTime, oldTime); err != nil {
 		t.Fatalf("Chtimes() error = %v", err)
 	}
@@ -706,7 +1003,9 @@ printf '%s\n' 'dump-content'
 		Port:           3306,
 		User:           "backup_user",
 		Password:       "BACKUP_DB_PASSWORD",
-		RetentionDays:  7,
+		Retention: &jobRetentionConfig{
+			KeepHourly: 1,
+		},
 	}
 
 	if err := runner.runDatabaseDumpJob(context.Background(), job); err != nil {
@@ -744,5 +1043,275 @@ printf '%s\n' 'dump-content'
 	}
 	if strings.TrimSpace(string(content)) != "dump-content" {
 		t.Fatalf("unexpected dump content: %q", string(content))
+	}
+}
+
+func TestRunDatabaseDumpJobRetriesTemporaryFailures(t *testing.T) {
+	dir := t.TempDir()
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousWD)
+	})
+
+	attemptsPath := filepath.Join(dir, "attempts.txt")
+	t.Setenv("TEST_DUMP_ATTEMPTS_FILE", attemptsPath)
+
+	binaryPath := filepath.Join(dir, "fake-dump.sh")
+	script := `#!/usr/bin/env bash
+set -eu
+attempt_file="${TEST_DUMP_ATTEMPTS_FILE}"
+attempt=0
+if [ -f "$attempt_file" ]; then
+  attempt=$(cat "$attempt_file")
+fi
+attempt=$((attempt + 1))
+printf '%s' "$attempt" > "$attempt_file"
+
+if [ "$attempt" -lt 3 ]; then
+  printf '%s\n' 'temporary database failure' >&2
+  exit 1
+fi
+
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+
+	runner := newTemplateRunner(config{
+		Database: databaseDefaultsConfig{
+			DumpTool: binaryPath,
+			Gzip:     false,
+		},
+	}, os.Stdout, os.Stderr)
+
+	var gotSleeps []time.Duration
+	runner.sleep = func(ctx context.Context, delay time.Duration) error {
+		gotSleeps = append(gotSleeps, delay)
+		return nil
+	}
+
+	job := jobConfig{
+		Name:           "db_job",
+		Type:           "database_dump",
+		Schedule:       "0 2 * * *",
+		TimeoutMinutes: 90,
+		DatabaseName:   "myapp",
+		Host:           "127.0.0.1",
+		Port:           3306,
+		User:           "backup_user",
+		Password:       "BACKUP_DB_PASSWORD",
+	}
+
+	if err := runner.runDatabaseDumpJob(context.Background(), job); err != nil {
+		t.Fatalf("runDatabaseDumpJob() error = %v", err)
+	}
+
+	attemptBytes, err := os.ReadFile(attemptsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.TrimSpace(string(attemptBytes)) != "3" {
+		t.Fatalf("expected 3 dump attempts, got %q", string(attemptBytes))
+	}
+
+	wantSleeps := []time.Duration{15 * time.Second, 30 * time.Second}
+	if len(gotSleeps) != len(wantSleeps) {
+		t.Fatalf("unexpected retry sleeps: got %#v, want %#v", gotSleeps, wantSleeps)
+	}
+	for i := range wantSleeps {
+		if gotSleeps[i] != wantSleeps[i] {
+			t.Fatalf("unexpected retry sleeps: got %#v, want %#v", gotSleeps, wantSleeps)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, "backups", "db_job"))
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 dump file, got %d", len(entries))
+	}
+
+	dumpPath := filepath.Join(dir, "backups", "db_job", entries[0].Name())
+	content, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.TrimSpace(string(content)) != "dump-content" {
+		t.Fatalf("unexpected dump content: %q", string(content))
+	}
+}
+
+func TestRunDatabaseDumpJobAlsoCreatesResticBackupWhenEnabled(t *testing.T) {
+	dir := t.TempDir()
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousWD)
+	})
+
+	dumpBinaryPath := filepath.Join(dir, "fake-dump.sh")
+	dumpScript := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(dumpBinaryPath, []byte(dumpScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	argsPath := filepath.Join(dir, "restic-args.txt")
+	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	resticScript := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+`
+	if err := os.WriteFile(resticBinaryPath, []byte(resticScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+	t.Setenv(resticPasswordEnv, "restic-secret")
+
+	runner := newTemplateRunner(config{
+		Database: databaseDefaultsConfig{
+			DumpTool: dumpBinaryPath,
+			Gzip:     true,
+		},
+		Restic: resticConfig{
+			Binary:     resticBinaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "db_job",
+		Type:           "database_dump",
+		Schedule:       "0 2 * * *",
+		TimeoutMinutes: 90,
+		DatabaseName:   "myapp",
+		Host:           "127.0.0.1",
+		Port:           3306,
+		User:           "backup_user",
+		Password:       "BACKUP_DB_PASSWORD",
+		Retention: &jobRetentionConfig{
+			KeepHourly: 1,
+		},
+	}
+
+	if err := runner.runDatabaseDumpJob(context.Background(), job); err != nil {
+		t.Fatalf("runDatabaseDumpJob() error = %v", err)
+	}
+
+	logBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("unexpected restic command log: %q", string(logBytes))
+	}
+
+	firstCall := strings.Fields(lines[0])
+	wantBackupCall := []string{"-r", "/tmp/restic-repo", "backup", "--tag", "db_job", filepath.Join("backups", "db_job")}
+	if len(firstCall) != len(wantBackupCall) {
+		t.Fatalf("unexpected backup call: got %#v, want %#v", firstCall, wantBackupCall)
+	}
+	for i := range wantBackupCall {
+		if firstCall[i] != wantBackupCall[i] {
+			t.Fatalf("unexpected backup call: got %#v, want %#v", firstCall, wantBackupCall)
+		}
+	}
+
+	secondCall := strings.Fields(lines[1])
+	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--prune", "--tag", "db_job", "--keep-hourly", "1"}
+	if len(secondCall) != len(wantForgetCall) {
+		t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
+	}
+	for i := range wantForgetCall {
+		if secondCall[i] != wantForgetCall[i] {
+			t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
+		}
+	}
+}
+
+func TestPruneDatabaseDumpFilesKeepsHourlyAndDailyBuckets(t *testing.T) {
+	dir := t.TempDir()
+	location := time.UTC
+	now := time.Date(2026, 4, 10, 12, 30, 0, 0, location)
+
+	files := map[string]time.Time{
+		"hour-11-old.sql.gz":      time.Date(2026, 4, 10, 11, 5, 0, 0, location),
+		"hour-11-latest.sql.gz":   time.Date(2026, 4, 10, 11, 45, 0, 0, location),
+		"hour-10.sql.gz":          time.Date(2026, 4, 10, 10, 15, 0, 0, location),
+		"hour-09.sql.gz":          time.Date(2026, 4, 10, 9, 30, 0, 0, location),
+		"day-09-latest.sql.gz":    time.Date(2026, 4, 9, 22, 0, 0, 0, location),
+		"day-08-latest.sql.gz":    time.Date(2026, 4, 8, 21, 0, 0, 0, location),
+		"day-07-should-prune.sql": time.Date(2026, 4, 7, 20, 0, 0, 0, location),
+	}
+
+	for name, modTime := range files {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(name), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", name, err)
+		}
+		if err := os.Chtimes(path, modTime, modTime); err != nil {
+			t.Fatalf("Chtimes(%s) error = %v", name, err)
+		}
+	}
+
+	retention := &jobRetentionConfig{
+		KeepHourly: 3,
+		KeepDaily:  3,
+	}
+	if err := pruneDatabaseDumpFiles(dir, retention, now); err != nil {
+		t.Fatalf("pruneDatabaseDumpFiles() error = %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+
+	got := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		got[entry.Name()] = struct{}{}
+	}
+
+	for _, name := range []string{
+		"hour-11-latest.sql.gz",
+		"hour-10.sql.gz",
+		"hour-09.sql.gz",
+		"day-09-latest.sql.gz",
+		"day-08-latest.sql.gz",
+	} {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("expected %s to be kept, remaining files: %#v", name, got)
+		}
+	}
+
+	for _, name := range []string{
+		"hour-11-old.sql.gz",
+		"day-07-should-prune.sql",
+	} {
+		if _, ok := got[name]; ok {
+			t.Fatalf("expected %s to be pruned, remaining files: %#v", name, got)
+		}
 	}
 }

@@ -115,7 +115,8 @@ Main sections:
       "--triggers",
       "--events"
     ],
-    "gzip": true
+    "gzip": true,
+    "restic": true
   },
   "restic": {
     "binary": "/usr/bin/restic",
@@ -132,20 +133,8 @@ Main sections:
       "port": 3306,
       "user": "backup_user",
       "password": "MYAPP_DB_PASSWORD",
-      "retention_days": 7
-    },
-    {
-      "name": "restic_db",
-      "type": "restic_backup",
-      "schedule": "20 2 * * *",
-      "timeout_minutes": 120,
-      "sources": [
-        "./backups/db_dump"
-      ],
-      "tags": [
-        "db"
-      ],
       "retention": {
+        "keep_hourly": 3,
         "keep_daily": 14
       }
     },
@@ -194,7 +183,8 @@ General application metadata.
 
 Shared database dump defaults. This controls how Backuper invokes `mariadb-dump`
 or `mysqldump` for every `database_dump` job.
-This section contains only shared behavior such as `dump_tool`, `dump_flags` and `gzip`.
+This section contains shared behavior such as `dump_tool`, `dump_flags`, `gzip`
+and optional `restic`.
 
 ### `restic`
 
@@ -224,7 +214,14 @@ For `database_dump` jobs, connection details live directly in the job:
 - `password`
 
 `password` is the name of the environment variable that stores the database password.
-Local dump file retention is controlled by `retention_days`.
+When `database.restic` is enabled, every `database_dump` job also creates its own
+restic snapshot from `./backups/<job_name>` (or `job.output_dir`) with tag equal to
+the job name, and applies the same `retention` policy to restic snapshots.
+If `database.restic` is omitted and shared restic config is present, this behavior is
+enabled automatically.
+Local dump file retention can also be defined with the same optional `retention` block.
+This pruning is applied to files already present in the local dump directory, for example
+keeping the latest 3 hourly dumps and 14 daily dumps.
 Dump files are written per job into `./backups/<job_name>` by default, or into
 `job.output_dir` if you want a custom local path.
 
@@ -283,8 +280,9 @@ Start it with:
 go run ./cmd/backuper api -config ./configs/config.json -listen 127.0.0.1:8080
 ```
 
-Available endpoint:
+Available endpoints:
 
+- `GET /api/health`
 - `GET /api/restic/snapshots`
 
 Optional filters:
@@ -293,7 +291,32 @@ Optional filters:
 - `tag=a,b`
 - `tag=a&tag=b`
 
-Example:
+Health example:
+
+```bash
+curl 'http://127.0.0.1:8080/api/health'
+```
+
+The health endpoint returns configured jobs together with whether the latest
+successful backup for that job is not older than 24 hours:
+
+```json
+{
+  "jobs": [
+    {
+      "name": "db_dump",
+      "healthy": true,
+      "last_success_at": "2026-04-10T12:00:00Z"
+    },
+    {
+      "name": "restic_uploads",
+      "healthy": false
+    }
+  ]
+}
+```
+
+Snapshots example:
 
 ```bash
 curl 'http://127.0.0.1:8080/api/restic/snapshots?tag=a&tag=b'

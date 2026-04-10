@@ -1,0 +1,59 @@
+{
+  "app": {
+    "name": "backuper",
+    "timezone": "Europe/Warsaw"
+  },
+  "database": {
+    "dump_tool": "mariadb-dump",
+    "dump_flags": [
+      "--single-transaction",
+      "--quick",
+      "--routines",
+      "--triggers",
+      "--events"
+    ],
+    "gzip": true,
+    "restic": true
+  },
+  "restic": {
+    "binary": "/usr/bin/restic",
+    "repository": "sftp://user@warehouse:22//vault/backups/footballmat"
+  },
+  "jobs": [
+    {
+      "name": "db_app_main_dump",
+      "type": "database_dump",
+      "schedule": "*/5 * * * *",
+      "timeout_minutes": 90,
+      "database_name": "user",
+      "host": "host",
+      "port": 3306,
+      "user": "user",
+      "password": "password",
+      "retention": {
+        "keep_hourly": 3,
+        "keep_daily": 14
+      }
+    },
+    {
+      "name": "restic_test",
+      "type": "restic_backup",
+      "schedule": "*/5 * * * *",
+      "timeout_minutes": 180,
+      "sources": [
+        "/home/bartek/backup_test/A",
+        "/home/bartek/backup_test/B",
+        "/home/bartek/backup_test/C"
+      ],
+      "tags": [
+        "a",
+        "b",
+        "c"
+      ],
+      "retention": {
+        "keep_hourly": 3,
+        "keep_daily": 14
+      }
+    }
+  ]
+}

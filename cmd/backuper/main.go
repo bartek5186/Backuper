@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,7 +34,14 @@ const (
 	resticSFTPProxySubcommand = "restic-sftp-proxy"
 	defaultAPIListenAddress   = "127.0.0.1:8080"
 	defaultAPIRequestTimeout  = 30 * time.Second
+	defaultHealthMaxAge       = 24 * time.Hour
 )
+
+var databaseDumpRetryBackoff = []time.Duration{
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
 
 type resticSFTPConnection struct {
 	User string
@@ -46,6 +54,17 @@ type resticSnapshotsResponse struct {
 	Count      int               `json:"count"`
 	Tags       []string          `json:"tags,omitempty"`
 	Snapshots  []json.RawMessage `json:"snapshots"`
+}
+
+type jobHealthStatus struct {
+	Name          string     `json:"name"`
+	Healthy       bool       `json:"healthy"`
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	Error         string     `json:"error,omitempty"`
+}
+
+type healthResponse struct {
+	Jobs []jobHealthStatus `json:"jobs"`
 }
 
 type resticSnapshotSummary struct {
@@ -62,6 +81,7 @@ type errorResponse struct {
 
 type apiServer struct {
 	runner *templateRunner
+	jobs   []jobConfig
 	out    *os.File
 	errOut *os.File
 }
@@ -186,7 +206,7 @@ func runServe(args []string) int {
 		return 1
 	}
 
-	if err := checkRuntimeDependencies(cfg, selectedJobs, hasJobType(cfg.Jobs, "restic_backup")); err != nil {
+	if err := checkRuntimeDependencies(cfg, selectedJobs, requireResticForJobs(cfg, selectedJobs)); err != nil {
 		var runtimeErr *runtimeCheckError
 		if errors.As(err, &runtimeErr) {
 			fmt.Fprintf(os.Stderr, "startup checks failed:\n%s\n", runtimeErr.pretty())
@@ -198,7 +218,7 @@ func runServe(args []string) int {
 	}
 
 	runner := newTemplateRunner(cfg, os.Stdout, os.Stderr)
-	api := newAPIServer(cfg, os.Stdout, os.Stderr)
+	api := newAPIServerWithRunner(runner, selectedJobs, os.Stdout, os.Stderr)
 	httpServer := &http.Server{
 		Addr:    *listenAddress,
 		Handler: api.routes(),
@@ -428,7 +448,7 @@ func runScheduler(args []string) int {
 		return 1
 	}
 
-	if err := checkRuntimeDependencies(cfg, selectedJobs, hasJobType(selectedJobs, "restic_backup")); err != nil {
+	if err := checkRuntimeDependencies(cfg, selectedJobs, requireResticForJobs(cfg, selectedJobs)); err != nil {
 		var runtimeErr *runtimeCheckError
 		if errors.As(err, &runtimeErr) {
 			fmt.Fprintf(os.Stderr, "startup checks failed:\n%s\n", runtimeErr.pretty())
@@ -484,6 +504,7 @@ type databaseDefaultsConfig struct {
 	DumpTool  string   `json:"dump_tool"`
 	DumpFlags []string `json:"dump_flags"`
 	Gzip      bool     `json:"gzip"`
+	Restic    *bool    `json:"restic,omitempty"`
 }
 
 type resticConfig struct {
@@ -527,17 +548,32 @@ type runtimeCheckError struct {
 }
 
 type templateRunner struct {
-	cfg     config
-	out     *os.File
-	errOut  *os.File
-	mu      sync.Mutex
-	running map[string]struct{}
-	wg      sync.WaitGroup
+	cfg      config
+	out      *os.File
+	errOut   *os.File
+	mu       sync.Mutex
+	resticMu sync.Mutex
+	running  map[string]struct{}
+	wg       sync.WaitGroup
+	sleep    func(context.Context, time.Duration) error
 }
 
 type resticWorkUnit struct {
 	sources []string
 	tag     string
+}
+
+type databaseDumpFile struct {
+	path    string
+	modTime time.Time
+}
+
+func (c config) databaseResticEnabled() bool {
+	if c.Database.Restic != nil {
+		return *c.Database.Restic
+	}
+
+	return strings.TrimSpace(c.Restic.Binary) != "" || strings.TrimSpace(c.Restic.Repository) != ""
 }
 
 type resolvedDatabaseDumpConfig struct {
@@ -589,12 +625,18 @@ func newTemplateRunner(cfg config, out, errOut *os.File) *templateRunner {
 		out:     out,
 		errOut:  errOut,
 		running: make(map[string]struct{}),
+		sleep:   sleepWithContext,
 	}
 }
 
 func newAPIServer(cfg config, out, errOut *os.File) *apiServer {
+	return newAPIServerWithRunner(newTemplateRunner(cfg, out, errOut), cfg.Jobs, out, errOut)
+}
+
+func newAPIServerWithRunner(runner *templateRunner, jobs []jobConfig, out, errOut *os.File) *apiServer {
 	return &apiServer{
-		runner: newTemplateRunner(cfg, out, errOut),
+		runner: runner,
+		jobs:   append([]jobConfig(nil), jobs...),
 		out:    out,
 		errOut: errOut,
 	}
@@ -602,8 +644,27 @@ func newAPIServer(cfg config, out, errOut *os.File) *apiServer {
 
 func (s *apiServer) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/restic/snapshots", s.handleResticSnapshots)
 	return mux
+}
+
+func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), defaultAPIRequestTimeout)
+	defer cancel()
+
+	statuses, err := s.collectJobHealthStatuses(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, healthResponse{Jobs: statuses})
 }
 
 func (s *apiServer) handleResticSnapshots(w http.ResponseWriter, r *http.Request) {
@@ -628,6 +689,199 @@ func (s *apiServer) handleResticSnapshots(w http.ResponseWriter, r *http.Request
 		Tags:       tags,
 		Snapshots:  snapshots,
 	})
+}
+
+func (s *apiServer) collectJobHealthStatuses(ctx context.Context) ([]jobHealthStatus, error) {
+	statuses := make([]jobHealthStatus, 0, len(s.jobs))
+	now := time.Now()
+
+	var (
+		snapshots   []resticSnapshotSummary
+		resticError error
+	)
+	if hasJobType(s.jobs, "restic_backup") || (hasJobType(s.jobs, "database_dump") && s.runner.cfg.databaseResticEnabled()) {
+		snapshots, resticError = s.runner.listResticSnapshotSummaries(ctx, nil)
+	}
+
+	for _, job := range s.jobs {
+		status := jobHealthStatus{Name: job.Name}
+
+		switch job.Type {
+		case "database_dump":
+			if s.runner.cfg.databaseResticEnabled() {
+				if resticError != nil {
+					status.Error = resticError.Error()
+					break
+				}
+
+				lastSuccessAt, err := latestDatabaseDumpResticSuccess(job, snapshots)
+				if err != nil {
+					status.Error = err.Error()
+					break
+				}
+				if lastSuccessAt != nil {
+					status.LastSuccessAt = lastSuccessAt
+					status.Healthy = successIsFresh(*lastSuccessAt, now, defaultHealthMaxAge)
+				}
+				break
+			}
+
+			lastSuccessAt, err := latestDatabaseDumpSuccess(job)
+			if err != nil {
+				status.Error = err.Error()
+				break
+			}
+			if lastSuccessAt != nil {
+				status.LastSuccessAt = lastSuccessAt
+				status.Healthy = successIsFresh(*lastSuccessAt, now, defaultHealthMaxAge)
+			}
+		case "restic_backup":
+			if resticError != nil {
+				status.Error = resticError.Error()
+				break
+			}
+
+			lastSuccessAt, err := latestResticJobSuccess(job, snapshots)
+			if err != nil {
+				status.Error = err.Error()
+				break
+			}
+			if lastSuccessAt != nil {
+				status.LastSuccessAt = lastSuccessAt
+				status.Healthy = successIsFresh(*lastSuccessAt, now, defaultHealthMaxAge)
+			}
+		default:
+			status.Error = fmt.Sprintf("unsupported job type %q", job.Type)
+		}
+
+		statuses = append(statuses, status)
+	}
+
+	return statuses, nil
+}
+
+func latestDatabaseDumpSuccess(job jobConfig) (*time.Time, error) {
+	dir := databaseDumpOutputDir(job)
+	if _, err := os.Stat(dir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat dump output dir %s: %w", dir, err)
+	}
+
+	files, err := listDatabaseDumpFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	latest := files[0].modTime
+	return &latest, nil
+}
+
+func successIsFresh(lastSuccessAt, now time.Time, maxAge time.Duration) bool {
+	if lastSuccessAt.After(now) {
+		return true
+	}
+
+	return now.Sub(lastSuccessAt) <= maxAge
+}
+
+func latestResticJobSuccess(job jobConfig, snapshots []resticSnapshotSummary) (*time.Time, error) {
+	workUnits, err := planResticWorkUnits(job)
+	if err != nil {
+		return nil, err
+	}
+
+	var latest time.Time
+	matchedAny := false
+	for _, unit := range workUnits {
+		unitLatest, ok := latestResticUnitSuccess(unit, snapshots)
+		if !ok {
+			return nil, nil
+		}
+		if !matchedAny || unitLatest.After(latest) {
+			latest = unitLatest
+			matchedAny = true
+		}
+	}
+
+	if !matchedAny {
+		return nil, nil
+	}
+
+	return &latest, nil
+}
+
+func latestDatabaseDumpResticSuccess(job jobConfig, snapshots []resticSnapshotSummary) (*time.Time, error) {
+	unit := resticWorkUnit{
+		sources: []string{databaseDumpOutputDir(job)},
+		tag:     job.Name,
+	}
+
+	latest, ok := latestResticUnitSuccess(unit, snapshots)
+	if !ok {
+		return nil, nil
+	}
+
+	return &latest, nil
+}
+
+func latestResticUnitSuccess(unit resticWorkUnit, snapshots []resticSnapshotSummary) (time.Time, bool) {
+	var latest time.Time
+	found := false
+	for _, snapshot := range snapshots {
+		if !resticUnitMatchesSnapshot(unit, snapshot) {
+			continue
+		}
+
+		if !found || snapshot.Time.After(latest) {
+			latest = snapshot.Time
+			found = true
+		}
+	}
+
+	return latest, found
+}
+
+func resticUnitMatchesSnapshot(unit resticWorkUnit, snapshot resticSnapshotSummary) bool {
+	if unit.tag != "" {
+		return stringSliceContains(snapshot.Tags, unit.tag)
+	}
+
+	return stringSlicesEqual(normalizePaths(snapshot.Paths), normalizePaths(unit.sources))
+}
+
+func normalizePaths(paths []string) []string {
+	normalized := make([]string, 0, len(paths))
+	for _, value := range paths {
+		normalized = append(normalized, filepath.Clean(strings.TrimSpace(value)))
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func stringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
@@ -777,22 +1031,17 @@ func (c config) validate() error {
 			problems = append(problems, prefix+".timeout_minutes must be greater than 0")
 		}
 
-		if job.RetentionDays < 0 {
-			problems = append(problems, prefix+".retention_days must be greater than or equal to 0")
+		if job.RetentionDays != 0 {
+			problems = append(problems, prefix+".retention_days is no longer supported; use retention.keep_daily and/or retention.keep_hourly")
 		}
 
 		switch job.Type {
 		case "database_dump":
 			needsDatabase = true
-			if job.Retention != nil {
-				problems = append(problems, prefix+".retention is only supported for restic_backup jobs")
-			}
+			problems = appendRetentionProblems(problems, prefix+".retention", job.Retention)
 			problems = appendDatabaseJobProblems(problems, prefix, job)
 		case "restic_backup":
 			needsRestic = true
-			if job.RetentionDays > 0 {
-				problems = append(problems, prefix+".retention_days is only supported for database_dump jobs")
-			}
 			if len(job.Sources) == 0 {
 				problems = append(problems, prefix+" must define at least one source for restic_backup jobs")
 			}
@@ -809,6 +1058,10 @@ func (c config) validate() error {
 			problems = append(problems, fmt.Sprintf("%s.type must be one of %q or %q", prefix, "database_dump", "restic_backup"))
 		}
 
+	}
+
+	if needsDatabase && c.databaseResticEnabled() {
+		needsRestic = true
 	}
 
 	if needsDatabase && strings.TrimSpace(c.Database.DumpTool) == "" {
@@ -869,6 +1122,14 @@ func checkRuntimeDependencies(cfg config, jobs []jobConfig, requireRestic bool) 
 	}
 
 	return nil
+}
+
+func requireResticForJobs(cfg config, jobs []jobConfig) bool {
+	if hasJobType(jobs, "restic_backup") {
+		return true
+	}
+
+	return hasJobType(jobs, "database_dump") && cfg.databaseResticEnabled()
 }
 
 func appendBinaryAvailabilityProblem(problems []string, label, binary string) []string {
@@ -1110,7 +1371,8 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 		return fmt.Errorf("create dump output dir %s: %w", outputDir, err)
 	}
 
-	fileName := databaseDumpFileName(job.Name, database.Gzip, time.Now())
+	now := r.currentTime()
+	fileName := databaseDumpFileName(job.Name, database.Gzip, now)
 	outputPath := filepath.Join(outputDir, fileName)
 
 	defaultsFilePath, err := createMySQLDefaultsFile(database, password)
@@ -1119,6 +1381,53 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 	}
 	defer os.Remove(defaultsFilePath)
 
+	if err := r.runDatabaseDumpWithRetry(ctx, job.Name, database, defaultsFilePath, outputPath); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(r.out, "[%s] dump saved to %s\n", job.Name, outputPath)
+
+	if job.Retention != nil {
+		if err := pruneDatabaseDumpFiles(outputDir, job.Retention, now); err != nil {
+			return err
+		}
+	}
+
+	if r.cfg.databaseResticEnabled() {
+		if err := r.runDatabaseDumpResticBackup(ctx, job, outputDir); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *templateRunner) runDatabaseDumpWithRetry(ctx context.Context, jobName string, database resolvedDatabaseDumpConfig, defaultsFilePath, outputPath string) error {
+	totalAttempts := len(databaseDumpRetryBackoff) + 1
+	var lastErr error
+
+	for attempt := 1; attempt <= totalAttempts; attempt++ {
+		err := r.runDatabaseDumpCommand(ctx, database, defaultsFilePath, outputPath)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		if ctx.Err() != nil || attempt == totalAttempts {
+			break
+		}
+
+		delay := databaseDumpRetryBackoff[attempt-1]
+		fmt.Fprintf(r.errOut, "[%s] database dump attempt %d/%d failed: %v; retrying in %s\n", jobName, attempt, totalAttempts, err, delay)
+		if err := r.sleep(ctx, delay); err != nil {
+			return fmt.Errorf("database dump retry interrupted for job %s: %w", jobName, err)
+		}
+	}
+
+	return lastErr
+}
+
+func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database resolvedDatabaseDumpConfig, defaultsFilePath, outputPath string) error {
 	outputFile, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create dump file %s: %w", outputPath, err)
@@ -1164,28 +1473,36 @@ func (r *templateRunner) runDatabaseDumpJob(ctx context.Context, job jobConfig) 
 		return fmt.Errorf("finalize dump file %s: %w", outputPath, err)
 	}
 
-	fmt.Fprintf(r.out, "[%s] dump saved to %s\n", job.Name, outputPath)
-
-	if job.RetentionDays > 0 {
-		if err := pruneDatabaseDumpFiles(outputDir, job.RetentionDays, time.Now()); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
 func (r *templateRunner) runResticBackupJob(ctx context.Context, job jobConfig) error {
-	if _, ok := os.LookupEnv(resticPasswordEnv); !ok {
-		return fmt.Errorf("required environment variable %s is not set", resticPasswordEnv)
-	}
-
-	baseArgs, envAdditions, err := r.resticBaseArgs()
+	workUnits, err := planResticWorkUnits(job)
 	if err != nil {
 		return err
 	}
 
-	workUnits, err := planResticWorkUnits(job)
+	return r.runResticWorkUnits(ctx, job.Name, job.Retention, workUnits)
+}
+
+func (r *templateRunner) runDatabaseDumpResticBackup(ctx context.Context, job jobConfig, outputDir string) error {
+	unit := resticWorkUnit{
+		sources: []string{outputDir},
+		tag:     job.Name,
+	}
+
+	return r.runResticWorkUnits(ctx, job.Name, job.Retention, []resticWorkUnit{unit})
+}
+
+func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string, retention *jobRetentionConfig, workUnits []resticWorkUnit) error {
+	if _, ok := os.LookupEnv(resticPasswordEnv); !ok {
+		return fmt.Errorf("required environment variable %s is not set", resticPasswordEnv)
+	}
+
+	r.resticMu.Lock()
+	defer r.resticMu.Unlock()
+
+	baseArgs, envAdditions, err := r.resticBaseArgs()
 	if err != nil {
 		return err
 	}
@@ -1198,11 +1515,11 @@ func (r *templateRunner) runResticBackupJob(ctx context.Context, job jobConfig) 
 		}
 		args = append(args, unit.sources...)
 
-		if err := r.runCommandWithEnv(ctx, job.Name, r.cfg.Restic.Binary, envAdditions, args...); err != nil {
-			return fmt.Errorf("restic backup failed for job %s: %w", job.Name, err)
+		if err := r.runCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...); err != nil {
+			return fmt.Errorf("restic backup failed for job %s: %w", jobName, err)
 		}
 
-		if job.Retention == nil {
+		if retention == nil {
 			continue
 		}
 
@@ -1211,10 +1528,10 @@ func (r *templateRunner) runResticBackupJob(ctx context.Context, job jobConfig) 
 		if unit.tag != "" {
 			forgetArgs = append(forgetArgs, "--tag", unit.tag)
 		}
-		forgetArgs = append(forgetArgs, retentionArgs(job.Retention)...)
+		forgetArgs = append(forgetArgs, retentionArgs(retention)...)
 
-		if err := r.runCommandWithEnv(ctx, job.Name, r.cfg.Restic.Binary, envAdditions, forgetArgs...); err != nil {
-			return fmt.Errorf("restic forget failed for job %s: %w", job.Name, err)
+		if err := r.runCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, forgetArgs...); err != nil {
+			return fmt.Errorf("restic forget failed for job %s: %w", jobName, err)
 		}
 	}
 
@@ -1270,6 +1587,9 @@ func (r *templateRunner) resticSnapshotsJSON(ctx context.Context, tags []string)
 	if _, ok := os.LookupEnv(resticPasswordEnv); !ok {
 		return nil, fmt.Errorf("required environment variable %s is not set", resticPasswordEnv)
 	}
+
+	r.resticMu.Lock()
+	defer r.resticMu.Unlock()
 
 	baseArgs, envAdditions, err := r.resticBaseArgs()
 	if err != nil {
@@ -1333,6 +1653,9 @@ func (r *templateRunner) restoreResticSnapshot(ctx context.Context, snapshotID, 
 		return err
 	}
 
+	r.resticMu.Lock()
+	defer r.resticMu.Unlock()
+
 	args := append([]string(nil), baseArgs...)
 	args = append(args, "restore", snapshotID, "--target", target)
 
@@ -1379,6 +1702,32 @@ func databaseDumpFileName(jobName string, gzipEnabled bool, now time.Time) strin
 	return fmt.Sprintf("%s_%s%s", jobName, now.Format("2006-01-02_15-04-05"), extension)
 }
 
+func (r *templateRunner) currentTime() time.Time {
+	now := time.Now()
+	if strings.TrimSpace(r.cfg.App.Timezone) == "" {
+		return now
+	}
+
+	location, err := time.LoadLocation(r.cfg.App.Timezone)
+	if err != nil {
+		return now
+	}
+
+	return now.In(location)
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func createMySQLDefaultsFile(database resolvedDatabaseDumpConfig, password string) (string, error) {
 	file, err := os.CreateTemp("", "backuper-mysql-*.cnf")
 	if err != nil {
@@ -1412,17 +1761,36 @@ func buildDatabaseDumpArgs(defaultsFilePath string, database resolvedDatabaseDum
 	return args
 }
 
-func pruneDatabaseDumpFiles(dir string, retentionDays int, now time.Time) error {
-	if retentionDays <= 0 {
+func pruneDatabaseDumpFiles(dir string, retention *jobRetentionConfig, now time.Time) error {
+	if retention == nil {
 		return nil
 	}
 
-	cutoff := now.AddDate(0, 0, -retentionDays)
-	entries, err := os.ReadDir(dir)
+	files, err := listDatabaseDumpFiles(dir)
 	if err != nil {
-		return fmt.Errorf("read dump output dir %s: %w", dir, err)
+		return err
 	}
 
+	keep := selectDatabaseDumpFilesToKeep(files, retention, now.Location())
+	for _, file := range files {
+		if _, ok := keep[file.path]; ok {
+			continue
+		}
+		if err := os.Remove(file.path); err != nil {
+			return fmt.Errorf("remove expired dump file %s: %w", file.path, err)
+		}
+	}
+
+	return nil
+}
+
+func listDatabaseDumpFiles(dir string) ([]databaseDumpFile, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read dump output dir %s: %w", dir, err)
+	}
+
+	files := make([]databaseDumpFile, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -1431,19 +1799,75 @@ func pruneDatabaseDumpFiles(dir string, retentionDays int, now time.Time) error 
 		path := filepath.Join(dir, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
-			return fmt.Errorf("stat dump file %s: %w", path, err)
+			return nil, fmt.Errorf("stat dump file %s: %w", path, err)
 		}
 
-		if !info.ModTime().Before(cutoff) {
+		files = append(files, databaseDumpFile{
+			path:    path,
+			modTime: info.ModTime(),
+		})
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].modTime.Equal(files[j].modTime) {
+			return files[i].path > files[j].path
+		}
+
+		return files[i].modTime.After(files[j].modTime)
+	})
+
+	return files, nil
+}
+
+func selectDatabaseDumpFilesToKeep(files []databaseDumpFile, retention *jobRetentionConfig, location *time.Location) map[string]struct{} {
+	keep := make(map[string]struct{})
+	if retention == nil {
+		return keep
+	}
+	if location == nil {
+		location = time.Local
+	}
+
+	keepLatestDatabaseDumpBuckets(files, keep, retention.KeepHourly, func(t time.Time) string {
+		return t.In(location).Format("2006-01-02 15")
+	})
+	keepLatestDatabaseDumpBuckets(files, keep, retention.KeepDaily, func(t time.Time) string {
+		return t.In(location).Format("2006-01-02")
+	})
+	keepLatestDatabaseDumpBuckets(files, keep, retention.KeepWeekly, func(t time.Time) string {
+		inLocation := t.In(location)
+		year, week := inLocation.ISOWeek()
+		return fmt.Sprintf("%04d-W%02d", year, week)
+	})
+	keepLatestDatabaseDumpBuckets(files, keep, retention.KeepMonthly, func(t time.Time) string {
+		return t.In(location).Format("2006-01")
+	})
+	keepLatestDatabaseDumpBuckets(files, keep, retention.KeepYearly, func(t time.Time) string {
+		return t.In(location).Format("2006")
+	})
+
+	return keep
+}
+
+func keepLatestDatabaseDumpBuckets(files []databaseDumpFile, keep map[string]struct{}, limit int, bucketKey func(time.Time) string) {
+	if limit <= 0 {
+		return
+	}
+
+	seenBuckets := make(map[string]struct{}, limit)
+	for _, file := range files {
+		key := bucketKey(file.modTime)
+		if _, ok := seenBuckets[key]; ok {
 			continue
 		}
 
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("remove expired dump file %s: %w", path, err)
+		seenBuckets[key] = struct{}{}
+		keep[file.path] = struct{}{}
+
+		if len(seenBuckets) == limit {
+			return
 		}
 	}
-
-	return nil
 }
 
 type stackedWriteCloser struct {
