@@ -569,6 +569,39 @@ func TestValidateRejectsMismatchedResticTags(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsEmptyResticExcludeEntries(t *testing.T) {
+	cfg := config{
+		App: appConfig{
+			Name:     "backuper",
+			Timezone: "Europe/Warsaw",
+		},
+		Restic: resticConfig{
+			Binary:     "/usr/bin/restic",
+			Repository: "sftp://backup@example//repo",
+		},
+		Jobs: []jobConfig{
+			{
+				Name:           "restic_uploads",
+				Type:           "restic_backup",
+				Schedule:       "15 * * * *",
+				TimeoutMinutes: 180,
+				Sources:        []string{"/data/A"},
+				Exclude:        []string{"cache", ""},
+				Tags:           []string{"uploads"},
+			},
+		},
+	}
+
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() returned nil error for empty exclude entry")
+	}
+
+	if !strings.Contains(err.Error(), "exclude[1] must not be empty") {
+		t.Fatalf("expected exclude validation error, got %v", err)
+	}
+}
+
 func TestParseResticSFTPConnectionSupportsURLForm(t *testing.T) {
 	connection, err := parseResticSFTPConnection("sftp://footballmat@warehouse:9990//vault/backups/footballmat")
 	if err != nil {
@@ -1461,6 +1494,79 @@ printf '\n' >> "$TEST_ARGS_FILE"
 
 	secondCall := strings.Fields(lines[1])
 	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--prune", "--tag", "db_job", "--keep-hourly", "1"}
+	if len(secondCall) != len(wantForgetCall) {
+		t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
+	}
+	for i := range wantForgetCall {
+		if secondCall[i] != wantForgetCall[i] {
+			t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
+		}
+	}
+}
+
+func TestRunResticBackupJobPassesExcludePatterns(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "restic-secret")
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "restic-args.txt")
+	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	resticScript := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+`
+	if err := os.WriteFile(resticBinaryPath, []byte(resticScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     resticBinaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "restic_uploads",
+		Type:           "restic_backup",
+		Schedule:       "15 * * * *",
+		TimeoutMinutes: 180,
+		Sources:        []string{"/data/uploads"},
+		Exclude:        []string{"cache", "*.tmp"},
+		Tags:           []string{"uploads"},
+		Retention: &jobRetentionConfig{
+			KeepDaily: 14,
+		},
+	}
+
+	if err := runner.runResticBackupJob(context.Background(), job); err != nil {
+		t.Fatalf("runResticBackupJob() error = %v", err)
+	}
+
+	logBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("unexpected restic command log: %q", string(logBytes))
+	}
+
+	firstCall := strings.Fields(lines[0])
+	wantBackupCall := []string{"-r", "/tmp/restic-repo", "backup", "--tag", "uploads", "--exclude", "cache", "--exclude", "*.tmp", "/data/uploads"}
+	if len(firstCall) != len(wantBackupCall) {
+		t.Fatalf("unexpected backup call: got %#v, want %#v", firstCall, wantBackupCall)
+	}
+	for i := range wantBackupCall {
+		if firstCall[i] != wantBackupCall[i] {
+			t.Fatalf("unexpected backup call: got %#v, want %#v", firstCall, wantBackupCall)
+		}
+	}
+
+	secondCall := strings.Fields(lines[1])
+	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--prune", "--tag", "uploads", "--keep-daily", "14"}
 	if len(secondCall) != len(wantForgetCall) {
 		t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
 	}

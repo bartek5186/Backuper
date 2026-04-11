@@ -63,6 +63,10 @@
         "/srv/myapp/uploads/public",
         "/srv/myapp/uploads/private"
       ],
+      "exclude": [
+        "cache",
+        "*.tmp"
+      ],
       "tags": [
         "uploads"
       ],
@@ -79,6 +83,9 @@
       "sources": [
         "/srv/myapp/videos/raw",
         "/srv/myapp/videos/processed"
+      ],
+      "exclude": [
+        "*.part"
       ],
       "tags": [
         "videos"

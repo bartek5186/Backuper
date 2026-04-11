@@ -166,6 +166,10 @@ Main sections:
         "/srv/myapp/uploads/public",
         "/srv/myapp/uploads/private"
       ],
+      "exclude": [
+        "cache",
+        "*.tmp"
+      ],
       "tags": [
         "uploads"
       ],
@@ -182,6 +186,9 @@ Main sections:
       "sources": [
         "/srv/myapp/videos/raw",
         "/srv/myapp/videos/processed"
+      ],
+      "exclude": [
+        "*.part"
       ],
       "tags": [
         "videos"
@@ -238,6 +245,8 @@ Defines all executable jobs. The first version supports two main job types:
 
 For `restic_backup` jobs, retention can be defined per job with an optional `retention` block.
 Supported fields are `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, and `keep_yearly`.
+An optional `exclude` list can also be defined for `restic_backup` jobs. Each entry
+is passed directly to `restic backup --exclude`.
 For `database_dump` jobs, connection details still live directly in the job:
 
 - `database_config`

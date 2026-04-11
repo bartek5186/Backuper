@@ -48,6 +48,10 @@
         "/home/bartek/backup_test/B",
         "/home/bartek/backup_test/C"
       ],
+      "exclude": [
+        "*.tmp",
+        "cache"
+      ],
       "tags": [
         "a",
         "b",

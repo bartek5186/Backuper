@@ -570,6 +570,7 @@ type jobConfig struct {
 	Tables         []string            `json:"tables,omitempty"`
 	ExcludeTables  []string            `json:"exclude_tables,omitempty"`
 	Sources        []string            `json:"sources,omitempty"`
+	Exclude        []string            `json:"exclude,omitempty"`
 	Tags           []string            `json:"tags,omitempty"`
 	Retention      *jobRetentionConfig `json:"retention,omitempty"`
 	RetentionDays  int                 `json:"retention_days,omitempty"`
@@ -1300,6 +1301,7 @@ func (c config) validate() error {
 					problems = append(problems, fmt.Sprintf("%s.sources[%d] must not be empty", prefix, j))
 				}
 			}
+			problems = appendNonEmptyListProblems(problems, prefix+".exclude", job.Exclude)
 			problems = appendNonEmptyListProblems(problems, prefix+".tags", job.Tags)
 			problems = appendResticTagProblems(problems, prefix, job)
 		default:
@@ -1788,7 +1790,7 @@ func (r *templateRunner) runResticBackupJob(ctx context.Context, job jobConfig) 
 		return err
 	}
 
-	return r.runResticWorkUnits(ctx, job.Name, job.Retention, workUnits)
+	return r.runResticWorkUnits(ctx, job.Name, job.Retention, job.Exclude, workUnits)
 }
 
 func (r *templateRunner) runDatabaseDumpResticBackup(ctx context.Context, job jobConfig, outputDir string) error {
@@ -1797,10 +1799,10 @@ func (r *templateRunner) runDatabaseDumpResticBackup(ctx context.Context, job jo
 		tag:     job.Name,
 	}
 
-	return r.runResticWorkUnits(ctx, job.Name, job.Retention, []resticWorkUnit{unit})
+	return r.runResticWorkUnits(ctx, job.Name, job.Retention, nil, []resticWorkUnit{unit})
 }
 
-func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string, retention *jobRetentionConfig, workUnits []resticWorkUnit) error {
+func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string, retention *jobRetentionConfig, excludes []string, workUnits []resticWorkUnit) error {
 	if _, ok := os.LookupEnv(resticPasswordEnv); !ok {
 		return fmt.Errorf("required environment variable %s is not set", resticPasswordEnv)
 	}
@@ -1818,6 +1820,9 @@ func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string,
 		args = append(args, "backup")
 		if unit.tag != "" {
 			args = append(args, "--tag", unit.tag)
+		}
+		for _, exclude := range excludes {
+			args = append(args, "--exclude", exclude)
 		}
 		args = append(args, unit.sources...)
 
