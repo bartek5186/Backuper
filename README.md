@@ -4,14 +4,58 @@ Backuper is a lightweight backup orchestrator for production servers.
 
 It is designed to coordinate backups of:
 
-- MySQL / MariaDB databases
+- MySQL / MariaDB, Postgres databases
 - user-uploaded files
-- large video files
+- or even large video files
 
 Backuper does **not** implement database dumping or file snapshotting from scratch. Instead, it orchestrates proven external tools:
 
 - `mariadb-dump`, `mysqldump`, or `pg_dump` for database dumps
 - `restic` for file and snapshot backups
+
+## Installation
+
+The recommended installation path is to run the published Docker image from
+GitHub Container Registry:
+
+- `ghcr.io/bartek5186/backuper:latest`
+- `ghcr.io/bartek5186/backuper:vX.Y.Z`
+
+Prerequisites:
+
+- Docker
+- Docker Compose plugin
+
+Minimal setup:
+
+1. Create a working directory on the server, for example `/opt/backuper`.
+2. Copy `compose.example.yaml` to `compose.yaml`.
+3. Create `configs/config.json`.
+4. Create `.env` with secrets such as `RESTIC_PASSWORD`, `SFTP_PASSWORD`, and database passwords.
+5. Create `backups/` for local dump files.
+6. Edit `compose.yaml` so the bind mounts match your real host paths.
+7. Pull and start the container:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Useful checks:
+
+```bash
+docker compose ps
+docker compose logs -f backuper
+```
+
+If the GHCR package is private, log in first:
+
+```bash
+docker login ghcr.io
+```
+
+The image contains the program and required CLI tools. Your `compose.yaml`,
+`configs/config.json`, `.env`, and `backups/` stay outside the image on the host.
 
 ## Goals
 
