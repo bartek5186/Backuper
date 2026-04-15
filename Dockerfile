@@ -19,6 +19,8 @@ RUN apt-get update \
         postgresql-client \
         restic \
         tzdata \
+        openssh-client \
+        sshpass \
     && if ! command -v mysqldump >/dev/null 2>&1 && command -v mariadb-dump >/dev/null 2>&1; then ln -s "$(command -v mariadb-dump)" /usr/local/bin/mysqldump; fi \
     && rm -rf /var/lib/apt/lists/*
 
