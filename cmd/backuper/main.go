@@ -573,6 +573,7 @@ type jobConfig struct {
 	Exclude        []string            `json:"exclude,omitempty"`
 	Tags           []string            `json:"tags,omitempty"`
 	Retention      *jobRetentionConfig `json:"retention,omitempty"`
+	ResticPrune    bool                `json:"restic_prune,omitempty"`
 	RetentionDays  int                 `json:"retention_days,omitempty"`
 }
 
@@ -1790,7 +1791,7 @@ func (r *templateRunner) runResticBackupJob(ctx context.Context, job jobConfig) 
 		return err
 	}
 
-	return r.runResticWorkUnits(ctx, job.Name, job.Retention, job.Exclude, workUnits)
+	return r.runResticWorkUnits(ctx, job.Name, job.Retention, job.Exclude, job.ResticPrune, workUnits)
 }
 
 func (r *templateRunner) runDatabaseDumpResticBackup(ctx context.Context, job jobConfig, outputDir string) error {
@@ -1799,10 +1800,10 @@ func (r *templateRunner) runDatabaseDumpResticBackup(ctx context.Context, job jo
 		tag:     job.Name,
 	}
 
-	return r.runResticWorkUnits(ctx, job.Name, job.Retention, nil, []resticWorkUnit{unit})
+	return r.runResticWorkUnits(ctx, job.Name, job.Retention, nil, job.ResticPrune, []resticWorkUnit{unit})
 }
 
-func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string, retention *jobRetentionConfig, excludes []string, workUnits []resticWorkUnit) error {
+func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string, retention *jobRetentionConfig, excludes []string, resticPrune bool, workUnits []resticWorkUnit) error {
 	if _, ok := os.LookupEnv(resticPasswordEnv); !ok {
 		return fmt.Errorf("required environment variable %s is not set", resticPasswordEnv)
 	}
@@ -1826,7 +1827,7 @@ func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string,
 		}
 		args = append(args, unit.sources...)
 
-		if err := r.runCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...); err != nil {
+		if err := r.runResticCommandWithEnv(ctx, jobName, envAdditions, args...); err != nil {
 			return fmt.Errorf("restic backup failed for job %s: %w", jobName, err)
 		}
 
@@ -1835,15 +1836,25 @@ func (r *templateRunner) runResticWorkUnits(ctx context.Context, jobName string,
 		}
 
 		forgetArgs := append([]string(nil), baseArgs...)
-		forgetArgs = append(forgetArgs, "forget", "--prune")
+		forgetArgs = append(forgetArgs, "forget")
 		if unit.tag != "" {
 			forgetArgs = append(forgetArgs, "--tag", unit.tag)
 		}
 		forgetArgs = append(forgetArgs, retentionArgs(retention)...)
 
-		if err := r.runCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, forgetArgs...); err != nil {
+		if err := r.runResticCommandWithEnv(ctx, jobName, envAdditions, forgetArgs...); err != nil {
 			return fmt.Errorf("restic forget failed for job %s: %w", jobName, err)
 		}
+	}
+
+	if !resticPrune {
+		return nil
+	}
+
+	pruneArgs := append([]string(nil), baseArgs...)
+	pruneArgs = append(pruneArgs, "prune")
+	if err := r.runResticCommandWithEnv(ctx, jobName, envAdditions, pruneArgs...); err != nil {
+		return fmt.Errorf("restic prune failed for job %s: %w", jobName, err)
 	}
 
 	return nil
@@ -1913,7 +1924,7 @@ func (r *templateRunner) resticSnapshotsJSON(ctx context.Context, tags []string)
 		args = append(args, "--tag", tag)
 	}
 
-	output, err := r.runCommandOutputWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	output, err := r.runResticCommandOutputWithEnv(ctx, "restic", envAdditions, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1970,7 +1981,7 @@ func (r *templateRunner) restoreResticSnapshot(ctx context.Context, snapshotID, 
 	args := append([]string(nil), baseArgs...)
 	args = append(args, "restore", snapshotID, "--target", target)
 
-	if err := r.runCommandWithEnv(ctx, "restore", r.cfg.Restic.Binary, envAdditions, args...); err != nil {
+	if err := r.runResticCommandWithEnv(ctx, "restore", envAdditions, args...); err != nil {
 		return fmt.Errorf("restic restore failed: %w", err)
 	}
 
@@ -1979,6 +1990,65 @@ func (r *templateRunner) restoreResticSnapshot(ctx context.Context, snapshotID, 
 
 func (r *templateRunner) runCommand(ctx context.Context, jobName, binary string, args ...string) error {
 	return r.runCommandWithEnv(ctx, jobName, binary, nil, args...)
+}
+
+func (r *templateRunner) runResticCommandWithEnv(ctx context.Context, jobName string, envAdditions []string, args ...string) error {
+	output, err := r.runResticCommandWithRecovery(ctx, jobName, envAdditions, args...)
+	if len(strings.TrimSpace(string(output))) > 0 {
+		fmt.Fprintf(r.out, "[%s] %s\n", jobName, strings.TrimSpace(string(output)))
+	}
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *templateRunner) runResticCommandOutputWithEnv(ctx context.Context, jobName string, envAdditions []string, args ...string) ([]byte, error) {
+	return r.runResticCommandWithRecovery(ctx, jobName, envAdditions, args...)
+}
+
+func (r *templateRunner) runResticCommandWithRecovery(ctx context.Context, jobName string, envAdditions []string, args ...string) ([]byte, error) {
+	output, err := executeCommandWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	if err == nil {
+		return output, nil
+	}
+
+	if ctx.Err() != nil || !isResticLockError(output) {
+		return nil, formatCommandError(r.cfg.Restic.Binary, args, output, err)
+	}
+
+	fmt.Fprintf(r.out, "[%s] restic lock detected, attempting stale lock cleanup and retry\n", jobName)
+	if unlockErr := r.unlockResticStaleLocks(ctx, jobName); unlockErr != nil {
+		return nil, fmt.Errorf("recover stale restic lock for %s %s: %w", r.cfg.Restic.Binary, strings.Join(args, " "), unlockErr)
+	}
+
+	output, err = executeCommandWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	if err != nil {
+		return nil, formatCommandError(r.cfg.Restic.Binary, args, output, err)
+	}
+
+	return output, nil
+}
+
+func (r *templateRunner) unlockResticStaleLocks(ctx context.Context, jobName string) error {
+	baseArgs, envAdditions, err := r.resticBaseArgs()
+	if err != nil {
+		return err
+	}
+
+	args := append([]string(nil), baseArgs...)
+	args = append(args, "unlock")
+
+	output, err := executeCommandWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	if len(strings.TrimSpace(string(output))) > 0 {
+		fmt.Fprintf(r.out, "[%s] %s\n", jobName, strings.TrimSpace(string(output)))
+	}
+	if err != nil {
+		return formatCommandError(r.cfg.Restic.Binary, args, output, err)
+	}
+
+	return nil
 }
 
 func (r *templateRunner) resolveDatabaseDumpConfig(job jobConfig) (resolvedDatabaseDumpConfig, error) {
@@ -2258,36 +2328,46 @@ func (w *stackedWriteCloser) Close() error {
 }
 
 func (r *templateRunner) runCommandWithEnv(ctx context.Context, jobName, binary string, envAdditions []string, args ...string) error {
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Env = mergeEnv(os.Environ(), envAdditions)
-
-	output, err := cmd.CombinedOutput()
+	output, err := executeCommandWithEnv(ctx, binary, envAdditions, args...)
 	if len(strings.TrimSpace(string(output))) > 0 {
 		fmt.Fprintf(r.out, "[%s] %s\n", jobName, strings.TrimSpace(string(output)))
 	}
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", binary, strings.Join(args, " "), err)
+		return formatCommandError(binary, args, output, err)
 	}
 
 	return nil
 }
 
 func (r *templateRunner) runCommandOutputWithEnv(ctx context.Context, binary string, envAdditions []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Env = mergeEnv(os.Environ(), envAdditions)
-
-	output, err := cmd.CombinedOutput()
+	output, err := executeCommandWithEnv(ctx, binary, envAdditions, args...)
 	if err != nil {
-		commandLine := binary + " " + strings.Join(args, " ")
-		trimmedOutput := strings.TrimSpace(string(output))
-		if trimmedOutput == "" {
-			return nil, fmt.Errorf("%s: %w", commandLine, err)
-		}
-
-		return nil, fmt.Errorf("%s: %w: %s", commandLine, err, trimmedOutput)
+		return nil, formatCommandError(binary, args, output, err)
 	}
 
 	return output, nil
+}
+
+func executeCommandWithEnv(ctx context.Context, binary string, envAdditions []string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Env = mergeEnv(os.Environ(), envAdditions)
+	return cmd.CombinedOutput()
+}
+
+func formatCommandError(binary string, args []string, output []byte, err error) error {
+	commandLine := binary + " " + strings.Join(args, " ")
+	trimmedOutput := strings.TrimSpace(string(output))
+	if trimmedOutput == "" {
+		return fmt.Errorf("%s: %w", commandLine, err)
+	}
+
+	return fmt.Errorf("%s: %w: %s", commandLine, err, trimmedOutput)
+}
+
+func isResticLockError(output []byte) bool {
+	message := strings.ToLower(string(output))
+	return strings.Contains(message, "repository is already locked") ||
+		strings.Contains(message, "unable to create lock in backend")
 }
 
 func shouldUseResticSFTPProxy(repository string) bool {

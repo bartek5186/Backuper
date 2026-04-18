@@ -87,6 +87,11 @@ Backuper runs separate backup jobs for:
 
 Each directory is backed up with `restic` into the same or a separate repository.
 
+If a restic command fails because a stale repository lock was left behind, for
+example after an interrupted container shutdown, Backuper automatically runs
+`restic unlock` and retries the command once. `restic unlock` removes only stale
+locks by default.
+
 ## Why this design
 
 Backuper intentionally avoids reimplementing backup engines.
@@ -123,7 +128,16 @@ Typical examples:
 
 ### 3. Retention
 
-Retention is handled through `restic forget --prune`.
+Snapshot retention is handled through `restic forget`.
+
+Pack cleanup is intentionally not run by default during regular backup jobs,
+because an aggressive `prune` directly after a successful backup can discard
+unreferenced data left by an interrupted earlier run and force the next backup
+to upload it again.
+
+If you explicitly want pack cleanup after a job, set `restic_prune: true` on
+that job. This runs a single `restic prune` after all backup and retention steps
+for the job are finished.
 
 A simple first-version policy can look like this:
 
@@ -245,6 +259,16 @@ Main sections:
 }
 ```
 
+Before the first backup run, initialize the repository from the configured
+`restic.repository` path with `restic init`. Backuper expects that repository
+to exist already.
+
+```
+export BACKUPER_RESTIC_REPOSITORY="sftp://warehouse@warehouse:PORT//backups/folder"
+restic --option "sftp.command=/usr/local/bin/backuper restic-sftp-proxy" \
+  -r "$BACKUPER_RESTIC_REPOSITORY" init
+  ```
+
 ## Config section overview
 
 ### `app`
@@ -277,6 +301,9 @@ The restic repository password is always read from `RESTIC_PASSWORD`.
 If the repository uses `sftp:` and `SFTP_PASSWORD` is present in the environment,
 Backuper automatically enables its internal restic SFTP proxy, so no `sftp.command`
 needs to be exposed in `config.json`.
+Backuper does not create or initialize the repository automatically.
+The target path configured in `restic.repository` must already be an initialized
+restic repository, for example created once with `restic init`.
 At startup, Backuper also loads a local `.env` file from the current working directory
 if it exists. Existing environment variables are not overridden.
 
@@ -291,6 +318,9 @@ For `restic_backup` jobs, retention can be defined per job with an optional `ret
 Supported fields are `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, and `keep_yearly`.
 An optional `exclude` list can also be defined for `restic_backup` jobs. Each entry
 is passed directly to `restic backup --exclude`.
+An optional `restic_prune` boolean can be enabled to run one `restic prune`
+after the job finishes. Leave it disabled unless you explicitly want repository
+pack cleanup in the backup path.
 For `database_dump` jobs, connection details still live directly in the job:
 
 - `database_config`
@@ -309,6 +339,8 @@ restic snapshot from `./backups/<job_name>` (or `job.output_dir`) with tag equal
 the job name, and applies the same `retention` policy to restic snapshots.
 If `restic` is omitted on that database config and shared restic config is present,
 this behavior is enabled automatically.
+`database_dump` jobs also support the optional `restic_prune` boolean for the
+same explicit post-backup cleanup behavior.
 Local dump file retention can also be defined with the same optional `retention` block.
 This pruning is applied to files already present in the local dump directory, for example
 keeping the latest 3 hourly dumps and 14 daily dumps.

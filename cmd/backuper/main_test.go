@@ -1016,6 +1016,176 @@ exit 0
 	}
 }
 
+func TestRunResticBackupJobRecoversFromStaleLock(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "restic-secret")
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "restic-args.txt")
+	statePath := filepath.Join(dir, "restic-state.txt")
+	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	t.Setenv("TEST_STATE_FILE", statePath)
+
+	resticScript := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+
+command_name="${3:-}"
+state_file="${TEST_STATE_FILE}"
+
+attempt=0
+if [ -f "$state_file" ]; then
+  attempt=$(cat "$state_file")
+fi
+
+if [ "$command_name" = "backup" ] && [ "$attempt" -eq 0 ]; then
+  printf '%s' '1' > "$state_file"
+  printf '%s\n' 'unable to create lock in backend: repository is already locked exclusively by PID 1234'
+  exit 1
+fi
+
+if [ "$command_name" = "unlock" ]; then
+  printf '%s\n' 'successfully removed locks'
+fi
+`
+	if err := os.WriteFile(resticBinaryPath, []byte(resticScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     resticBinaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "restic_uploads",
+		Type:           "restic_backup",
+		Schedule:       "15 * * * *",
+		TimeoutMinutes: 180,
+		Sources:        []string{"/data/uploads"},
+		Tags:           []string{"uploads"},
+	}
+
+	if err := runner.runResticBackupJob(context.Background(), job); err != nil {
+		t.Fatalf("runResticBackupJob() error = %v", err)
+	}
+
+	logBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("unexpected restic command log: %q", string(logBytes))
+	}
+
+	wantCalls := [][]string{
+		{"-r", "/tmp/restic-repo", "backup", "--tag", "uploads", "/data/uploads"},
+		{"-r", "/tmp/restic-repo", "unlock"},
+		{"-r", "/tmp/restic-repo", "backup", "--tag", "uploads", "/data/uploads"},
+	}
+
+	for i, wantCall := range wantCalls {
+		gotCall := strings.Fields(lines[i])
+		if len(gotCall) != len(wantCall) {
+			t.Fatalf("unexpected call %d: got %#v, want %#v", i, gotCall, wantCall)
+		}
+		for j := range wantCall {
+			if gotCall[j] != wantCall[j] {
+				t.Fatalf("unexpected call %d: got %#v, want %#v", i, gotCall, wantCall)
+			}
+		}
+	}
+}
+
+func TestListResticSnapshotSummariesRecoversFromStaleLock(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "restic-secret")
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "restic-args.txt")
+	statePath := filepath.Join(dir, "restic-state.txt")
+	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	t.Setenv("TEST_STATE_FILE", statePath)
+
+	resticScript := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+
+command_name="${3:-}"
+state_file="${TEST_STATE_FILE}"
+
+attempt=0
+if [ -f "$state_file" ]; then
+  attempt=$(cat "$state_file")
+fi
+
+if [ "$command_name" = "snapshots" ] && [ "$attempt" -eq 0 ]; then
+  printf '%s' '1' > "$state_file"
+  printf '%s\n' 'unable to create lock in backend: repository is already locked exclusively by PID 1234'
+  exit 1
+fi
+
+if [ "$command_name" = "unlock" ]; then
+  printf '%s\n' 'successfully removed locks'
+  exit 0
+fi
+
+printf '%s\n' '[{"id":"snapshot-1","time":"2026-04-10T14:00:00Z","tags":["uploads"]}]'
+`
+	if err := os.WriteFile(resticBinaryPath, []byte(resticScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     resticBinaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	snapshots, err := runner.listResticSnapshotSummaries(context.Background(), []string{"uploads"})
+	if err != nil {
+		t.Fatalf("listResticSnapshotSummaries() error = %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].ID != "snapshot-1" {
+		t.Fatalf("unexpected snapshots: %#v", snapshots)
+	}
+
+	logBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("unexpected restic command log: %q", string(logBytes))
+	}
+
+	wantCalls := [][]string{
+		{"-r", "/tmp/restic-repo", "snapshots", "--json", "--tag", "uploads"},
+		{"-r", "/tmp/restic-repo", "unlock"},
+		{"-r", "/tmp/restic-repo", "snapshots", "--json", "--tag", "uploads"},
+	}
+
+	for i, wantCall := range wantCalls {
+		gotCall := strings.Fields(lines[i])
+		if len(gotCall) != len(wantCall) {
+			t.Fatalf("unexpected call %d: got %#v, want %#v", i, gotCall, wantCall)
+		}
+		for j := range wantCall {
+			if gotCall[j] != wantCall[j] {
+				t.Fatalf("unexpected call %d: got %#v, want %#v", i, gotCall, wantCall)
+			}
+		}
+	}
+}
+
 func TestResticOperationsAreSerialized(t *testing.T) {
 	t.Setenv(resticPasswordEnv, "secret")
 
@@ -1493,7 +1663,7 @@ printf '\n' >> "$TEST_ARGS_FILE"
 	}
 
 	secondCall := strings.Fields(lines[1])
-	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--prune", "--tag", "db_job", "--keep-hourly", "1"}
+	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--tag", "db_job", "--keep-hourly", "1"}
 	if len(secondCall) != len(wantForgetCall) {
 		t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
 	}
@@ -1566,13 +1736,75 @@ printf '\n' >> "$TEST_ARGS_FILE"
 	}
 
 	secondCall := strings.Fields(lines[1])
-	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--prune", "--tag", "uploads", "--keep-daily", "14"}
+	wantForgetCall := []string{"-r", "/tmp/restic-repo", "forget", "--tag", "uploads", "--keep-daily", "14"}
 	if len(secondCall) != len(wantForgetCall) {
 		t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
 	}
 	for i := range wantForgetCall {
 		if secondCall[i] != wantForgetCall[i] {
 			t.Fatalf("unexpected forget call: got %#v, want %#v", secondCall, wantForgetCall)
+		}
+	}
+}
+
+func TestRunResticBackupJobRunsExplicitPruneOnceAfterForget(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "restic-secret")
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "restic-args.txt")
+	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
+	t.Setenv("TEST_ARGS_FILE", argsPath)
+	resticScript := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_ARGS_FILE"
+printf '\n' >> "$TEST_ARGS_FILE"
+`
+	if err := os.WriteFile(resticBinaryPath, []byte(resticScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     resticBinaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "restic_uploads",
+		Type:           "restic_backup",
+		Schedule:       "15 * * * *",
+		TimeoutMinutes: 180,
+		Sources:        []string{"/data/uploads"},
+		Tags:           []string{"uploads"},
+		Retention: &jobRetentionConfig{
+			KeepDaily: 14,
+		},
+		ResticPrune: true,
+	}
+
+	if err := runner.runResticBackupJob(context.Background(), job); err != nil {
+		t.Fatalf("runResticBackupJob() error = %v", err)
+	}
+
+	logBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("unexpected restic command log: %q", string(logBytes))
+	}
+
+	thirdCall := strings.Fields(lines[2])
+	wantPruneCall := []string{"-r", "/tmp/restic-repo", "prune"}
+	if len(thirdCall) != len(wantPruneCall) {
+		t.Fatalf("unexpected prune call: got %#v, want %#v", thirdCall, wantPruneCall)
+	}
+	for i := range wantPruneCall {
+		if thirdCall[i] != wantPruneCall[i] {
+			t.Fatalf("unexpected prune call: got %#v, want %#v", thirdCall, wantPruneCall)
 		}
 	}
 }
