@@ -92,6 +92,10 @@ example after an interrupted container shutdown, Backuper automatically runs
 `restic unlock` and retries the command once. `restic unlock` removes only stale
 locks by default.
 
+When Backuper is used as the internal `sftp.command` helper for restic, it marks
+that helper process through a dedicated environment variable so the helper cannot
+fall back to the default `serve` mode.
+
 ## Why this design
 
 Backuper intentionally avoids reimplementing backup engines.

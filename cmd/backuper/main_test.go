@@ -65,6 +65,17 @@ func TestLoadConfigSupportsDatabaseDefaultsAndJobSpecificConnections(t *testing.
 	}
 }
 
+func TestShouldRunImplicitResticSFTPProxy(t *testing.T) {
+	t.Setenv(backuperResticProxyEnv, "1")
+
+	if !shouldRunImplicitResticSFTPProxy(nil) {
+		t.Fatal("expected implicit restic sftp proxy mode to be enabled")
+	}
+	if shouldRunImplicitResticSFTPProxy([]string{"serve"}) {
+		t.Fatal("did not expect implicit restic sftp proxy mode when args are present")
+	}
+}
+
 func TestLoadConfigSupportsNamedDatabaseConfigs(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -649,8 +660,17 @@ func TestResticBaseArgsEnablesInternalSFTPProxyWhenPasswordIsSet(t *testing.T) {
 		t.Fatalf("unexpected repository args: %#v", args)
 	}
 
-	if len(envAdditions) != 1 || envAdditions[0] != backuperResticRepoEnv+"=sftp://footballmat@warehouse:9990//vault/backups/footballmat" {
+	wantEnvAdditions := []string{
+		backuperResticProxyEnv + "=1",
+		backuperResticRepoEnv + "=sftp://footballmat@warehouse:9990//vault/backups/footballmat",
+	}
+	if len(envAdditions) != len(wantEnvAdditions) {
 		t.Fatalf("unexpected restic env additions: %#v", envAdditions)
+	}
+	for i := range wantEnvAdditions {
+		if envAdditions[i] != wantEnvAdditions[i] {
+			t.Fatalf("unexpected restic env additions: %#v", envAdditions)
+		}
 	}
 }
 

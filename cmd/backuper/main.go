@@ -30,6 +30,7 @@ const (
 	postgresPasswordEnv       = "PGPASSWORD"
 	sftpPasswordEnv           = "SFTP_PASSWORD"
 	backuperResticRepoEnv     = "BACKUPER_RESTIC_REPOSITORY"
+	backuperResticProxyEnv    = "BACKUPER_RESTIC_SFTP_PROXY"
 	defaultConfigPath         = "./configs/config.json"
 	defaultSFTPKnownHosts     = "/tmp/backuper_restic_known_hosts"
 	resticSFTPProxySubcommand = "restic-sftp-proxy"
@@ -130,6 +131,10 @@ func main() {
 }
 
 func run(args []string) int {
+	if shouldRunImplicitResticSFTPProxy(args) {
+		return runResticSFTPProxy()
+	}
+
 	if err := loadDotEnvIfPresent(".env"); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load .env: %v\n", err)
 		return 1
@@ -194,6 +199,10 @@ func runValidate(args []string) int {
 
 	fmt.Fprintf(os.Stdout, "config %s is valid\n", *configPath)
 	return 0
+}
+
+func shouldRunImplicitResticSFTPProxy(args []string) bool {
+	return len(args) == 0 && strings.TrimSpace(os.Getenv(backuperResticProxyEnv)) == "1"
 }
 
 func printUsage(out *os.File) {
@@ -1871,6 +1880,7 @@ func (r *templateRunner) resticBaseArgs() ([]string, []string, error) {
 		}
 
 		args = append(args, "--option", "sftp.command="+executable+" "+resticSFTPProxySubcommand)
+		envAdditions = append(envAdditions, backuperResticProxyEnv+"=1")
 		envAdditions = append(envAdditions, backuperResticRepoEnv+"="+r.cfg.Restic.Repository)
 	}
 	args = append(args, "-r", r.cfg.Restic.Repository)
