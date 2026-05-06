@@ -1,7 +1,8 @@
 {
   "app": {
     "name": "backuper",
-    "timezone": "Europe/Warsaw"
+    "timezone": "Europe/Warsaw",
+    "max_concurrent_jobs": 1
   },
   "database": [
     {

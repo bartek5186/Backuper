@@ -400,6 +400,38 @@ func TestValidateRejectsRetentionDays(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsNegativeMaxConcurrentJobs(t *testing.T) {
+	cfg := config{
+		App: appConfig{
+			Name:              "backuper",
+			Timezone:          "Europe/Warsaw",
+			MaxConcurrentJobs: -1,
+		},
+		Jobs: []jobConfig{
+			{
+				Name:           "restic_uploads",
+				Type:           "restic_backup",
+				Schedule:       "15 * * * *",
+				TimeoutMinutes: 180,
+				Sources:        []string{"/data/uploads"},
+			},
+		},
+		Restic: resticConfig{
+			Binary:     "/usr/bin/restic",
+			Repository: "/tmp/restic-repo",
+		},
+	}
+
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() returned nil error for negative max_concurrent_jobs")
+	}
+
+	if !strings.Contains(err.Error(), "app.max_concurrent_jobs must be greater than or equal to 0") {
+		t.Fatalf("expected max_concurrent_jobs validation error, got %v", err)
+	}
+}
+
 func TestCheckRuntimeDependenciesRejectsMissingBinaries(t *testing.T) {
 	cfg := config{
 		Database: databaseConfigList{{DumpTool: "/tmp/definitely-missing-dump-tool"}},
@@ -1286,6 +1318,314 @@ printf '%s\n' '[]'
 	}
 	if maxSeen != 1 {
 		t.Fatalf("expected serialized restic access, max concurrency = %d", maxSeen)
+	}
+}
+
+func TestExecuteCommandWithEnvTerminatesChildProcessesOnContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "spawn-child.sh")
+	childPIDPath := filepath.Join(dir, "child.pid")
+	childTerminatedPath := filepath.Join(dir, "child-terminated.txt")
+	t.Setenv("TEST_CHILD_PID_FILE", childPIDPath)
+	t.Setenv("TEST_CHILD_TERMINATED_FILE", childTerminatedPath)
+
+	script := `#!/usr/bin/env bash
+set -eu
+(
+  trap 'printf terminated > "$TEST_CHILD_TERMINATED_FILE"; exit 0' TERM
+  printf '%s' "$BASHPID" > "$TEST_CHILD_PID_FILE"
+  while true; do sleep 1; done
+) &
+wait "$!"
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	logFile, err := os.Create(filepath.Join(dir, "commands.log"))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer logFile.Close()
+
+	runner := newTemplateRunner(config{}, logFile, logFile)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err = runner.executeCommandWithEnv(ctx, "test_job", binaryPath, nil)
+	if err == nil {
+		t.Fatal("executeCommandWithEnv() returned nil error for canceled context")
+	}
+
+	if pidBytes, readErr := os.ReadFile(childPIDPath); readErr == nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+		if parseErr == nil {
+			t.Cleanup(func() {
+				if process, findErr := os.FindProcess(pid); findErr == nil {
+					_ = process.Kill()
+				}
+			})
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, statErr := os.Stat(childTerminatedPath); statErr == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child process did not receive termination signal")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func TestTemplateRunnerLimitsConcurrentDatabaseJobs(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "mariadb-dump")
+	activeDir := filepath.Join(dir, "active")
+	maxPath := filepath.Join(dir, "max.txt")
+	t.Setenv("TEST_ACTIVE_DIR", activeDir)
+	t.Setenv("TEST_MAX_FILE", maxPath)
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	script := `#!/usr/bin/env bash
+set -eu
+active_dir="${TEST_ACTIVE_DIR}"
+max_file="${TEST_MAX_FILE}"
+mkdir -p "$active_dir"
+touch "$active_dir/$$"
+count=$(find "$active_dir" -type f | wc -l)
+max_seen=0
+if [ -f "$max_file" ]; then
+  max_seen=$(cat "$max_file")
+fi
+if [ "$count" -gt "$max_seen" ]; then
+  printf '%s' "$count" > "$max_file"
+fi
+sleep 1
+rm -f "$active_dir/$$"
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		App: appConfig{
+			MaxConcurrentJobs: 1,
+		},
+		Database: databaseConfigList{{
+			Type: "mariadb",
+		}},
+	}, os.Stdout, os.Stderr)
+
+	jobs := []jobConfig{
+		{
+			Name:           "db_job_a",
+			Type:           "database_dump",
+			TimeoutMinutes: 1,
+			DatabaseName:   "myapp",
+			Host:           "127.0.0.1",
+			Port:           3306,
+			User:           "backup_user",
+			Password:       "BACKUP_DB_PASSWORD",
+			OutputDir:      filepath.Join(dir, "a"),
+		},
+		{
+			Name:           "db_job_b",
+			Type:           "database_dump",
+			TimeoutMinutes: 1,
+			DatabaseName:   "myapp",
+			Host:           "127.0.0.1",
+			Port:           3306,
+			User:           "backup_user",
+			Password:       "BACKUP_DB_PASSWORD",
+			OutputDir:      filepath.Join(dir, "b"),
+		},
+	}
+
+	runner.dispatchSelectedJobs(context.Background(), jobs, time.Now())
+	runner.Wait()
+
+	maxBytes, err := os.ReadFile(maxPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	maxSeen, err := strconv.Atoi(strings.TrimSpace(string(maxBytes)))
+	if err != nil {
+		t.Fatalf("Atoi() error = %v", err)
+	}
+	if maxSeen != 1 {
+		t.Fatalf("expected max 1 concurrent database job, got %d", maxSeen)
+	}
+}
+
+func TestTemplateRunnerSkipsDuplicateJobWhileRunning(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "mariadb-dump")
+	attemptsPath := filepath.Join(dir, "attempts.txt")
+	t.Setenv("TEST_ATTEMPTS_FILE", attemptsPath)
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	script := `#!/usr/bin/env bash
+set -eu
+attempt_file="${TEST_ATTEMPTS_FILE}"
+attempts=0
+if [ -f "$attempt_file" ]; then
+  attempts=$(cat "$attempt_file")
+fi
+attempts=$((attempts + 1))
+printf '%s' "$attempts" > "$attempt_file"
+sleep 1
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		App: appConfig{
+			MaxConcurrentJobs: 2,
+		},
+		Database: databaseConfigList{{
+			Type: "mariadb",
+		}},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "db_job",
+		Type:           "database_dump",
+		TimeoutMinutes: 1,
+		DatabaseName:   "myapp",
+		Host:           "127.0.0.1",
+		Port:           3306,
+		User:           "backup_user",
+		Password:       "BACKUP_DB_PASSWORD",
+		OutputDir:      filepath.Join(dir, "dump"),
+	}
+
+	now := time.Now()
+	runner.launchJob(context.Background(), job, now)
+	runner.launchJob(context.Background(), job, now.Add(time.Minute))
+	runner.Wait()
+
+	attemptBytes, err := os.ReadFile(attemptsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.TrimSpace(string(attemptBytes)) != "1" {
+		t.Fatalf("expected one command attempt for duplicate running job, got %q", string(attemptBytes))
+	}
+}
+
+func TestExecuteCommandWithEnvLogsProcessFailure(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "fail.sh")
+	logPath := filepath.Join(dir, "commands.log")
+
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' 'failure output'
+exit 7
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{}, logFile, logFile)
+	_, err = runner.executeCommandWithEnv(context.Background(), "log_job", binaryPath, nil, "arg1")
+	if closeErr := logFile.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+	if err == nil {
+		t.Fatal("executeCommandWithEnv() returned nil error for failing command")
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	logContent := string(logBytes)
+	for _, fragment := range []string{
+		"start process job=log_job pid=",
+		"fail process job=log_job pid=",
+		"duration=",
+		"error=exit status 7",
+		"command=" + binaryPath + " arg1",
+	} {
+		if !strings.Contains(logContent, fragment) {
+			t.Fatalf("expected process log containing %q, got %q", fragment, logContent)
+		}
+	}
+}
+
+func TestRunDatabaseDumpJobLogsProcessSuccess(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "mariadb-dump")
+	logPath := filepath.Join(dir, "commands.log")
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Database: databaseConfigList{{
+			Type: "mariadb",
+		}},
+	}, logFile, logFile)
+
+	job := jobConfig{
+		Name:           "db_job",
+		Type:           "database_dump",
+		TimeoutMinutes: 1,
+		DatabaseName:   "myapp",
+		Host:           "127.0.0.1",
+		Port:           3306,
+		User:           "backup_user",
+		Password:       "BACKUP_DB_PASSWORD",
+		OutputDir:      filepath.Join(dir, "dump"),
+	}
+
+	if err := runner.runDatabaseDumpJob(context.Background(), job); err != nil {
+		t.Fatalf("runDatabaseDumpJob() error = %v", err)
+	}
+	if closeErr := logFile.Close(); closeErr != nil {
+		t.Fatalf("Close() error = %v", closeErr)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	logContent := string(logBytes)
+	for _, fragment := range []string{
+		"start process job=db_job pid=",
+		"finish process job=db_job pid=",
+		"duration=",
+		"command=mariadb-dump --defaults-extra-file=",
+	} {
+		if !strings.Contains(logContent, fragment) {
+			t.Fatalf("expected process log containing %q, got %q", fragment, logContent)
+		}
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +38,7 @@ const (
 	defaultAPIListenAddress   = "127.0.0.1:8080"
 	defaultAPIRequestTimeout  = 30 * time.Second
 	defaultHealthMaxAge       = 24 * time.Hour
+	defaultMaxConcurrentJobs  = 1
 )
 
 const defaultDatabaseConfigName = "default"
@@ -538,8 +540,9 @@ type config struct {
 }
 
 type appConfig struct {
-	Name     string `json:"name"`
-	Timezone string `json:"timezone"`
+	Name              string `json:"name"`
+	Timezone          string `json:"timezone"`
+	MaxConcurrentJobs int    `json:"max_concurrent_jobs,omitempty"`
 }
 
 type pathsConfig struct {
@@ -610,6 +613,7 @@ type templateRunner struct {
 	resticMu sync.Mutex
 	running  map[string]struct{}
 	wg       sync.WaitGroup
+	jobSlots chan struct{}
 	sleep    func(context.Context, time.Duration) error
 }
 
@@ -827,13 +831,23 @@ func (e *runtimeCheckError) pretty() string {
 }
 
 func newTemplateRunner(cfg config, out, errOut *os.File) *templateRunner {
+	maxConcurrentJobs := effectiveMaxConcurrentJobs(cfg.App.MaxConcurrentJobs)
 	return &templateRunner{
-		cfg:     cfg,
-		out:     out,
-		errOut:  errOut,
-		running: make(map[string]struct{}),
-		sleep:   sleepWithContext,
+		cfg:      cfg,
+		out:      out,
+		errOut:   errOut,
+		running:  make(map[string]struct{}),
+		jobSlots: make(chan struct{}, maxConcurrentJobs),
+		sleep:    sleepWithContext,
 	}
+}
+
+func effectiveMaxConcurrentJobs(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+
+	return defaultMaxConcurrentJobs
 }
 
 func newAPIServer(cfg config, out, errOut *os.File) *apiServer {
@@ -1235,6 +1249,10 @@ func (c config) validate() error {
 		problems = append(problems, fmt.Sprintf("app.timezone is invalid: %v", err))
 	}
 
+	if c.App.MaxConcurrentJobs < 0 {
+		problems = append(problems, "app.max_concurrent_jobs must be greater than or equal to 0")
+	}
+
 	if len(c.Jobs) == 0 {
 		problems = append(problems, "at least one job must be configured")
 	}
@@ -1598,7 +1616,7 @@ func (r *templateRunner) dispatchSelectedJobs(ctx context.Context, jobs []jobCon
 }
 
 func runContinuousScheduler(ctx context.Context, runner *templateRunner, jobs []jobConfig, location *time.Location) {
-	fmt.Fprintf(runner.out, "runner started for %d jobs in timezone %s\n", len(jobs), location.String())
+	fmt.Fprintf(runner.out, "runner started for %d jobs in timezone %s with max_concurrent_jobs=%d\n", len(jobs), location.String(), cap(runner.jobSlots))
 
 	for {
 		now := time.Now().In(location).Truncate(time.Minute)
@@ -1628,17 +1646,38 @@ func (r *templateRunner) launchJob(ctx context.Context, job jobConfig, triggerTi
 		defer r.finish(job.Name)
 		defer r.wg.Done()
 
+		if !r.acquireJobSlot(ctx, job, triggerTime) {
+			return
+		}
+		defer r.releaseJobSlot()
+
+		startedAt := time.Now()
 		jobCtx, cancel := context.WithTimeout(ctx, time.Duration(job.TimeoutMinutes)*time.Minute)
 		defer cancel()
 
-		fmt.Fprintf(r.out, "[%s] start job %s (%s)\n", triggerTime.Format(time.RFC3339), job.Name, job.Type)
+		fmt.Fprintf(r.out, "[%s] start job %s (%s)\n", startedAt.Format(time.RFC3339), job.Name, job.Type)
 		err := r.runJob(jobCtx, job)
+		duration := time.Since(startedAt).Round(time.Millisecond)
 		if err != nil {
-			fmt.Fprintf(r.errOut, "[%s] fail job %s: %v\n", triggerTime.Format(time.RFC3339), job.Name, err)
+			fmt.Fprintf(r.errOut, "[%s] fail job %s duration=%s error=%v\n", time.Now().Format(time.RFC3339), job.Name, duration, err)
 			return
 		}
-		fmt.Fprintf(r.out, "[%s] finish job %s\n", triggerTime.Format(time.RFC3339), job.Name)
+		fmt.Fprintf(r.out, "[%s] finish job %s duration=%s\n", time.Now().Format(time.RFC3339), job.Name, duration)
 	}(job, triggerTime)
+}
+
+func (r *templateRunner) acquireJobSlot(ctx context.Context, job jobConfig, triggerTime time.Time) bool {
+	select {
+	case r.jobSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		fmt.Fprintf(r.out, "[%s] skip job %s: scheduler stopping before a concurrency slot became available\n", triggerTime.Format(time.RFC3339), job.Name)
+		return false
+	}
+}
+
+func (r *templateRunner) releaseJobSlot() {
+	<-r.jobSlots
 }
 
 func (r *templateRunner) tryStart(jobName string) bool {
@@ -1726,7 +1765,7 @@ func (r *templateRunner) runDatabaseDumpWithRetry(ctx context.Context, jobName s
 	var lastErr error
 
 	for attempt := 1; attempt <= totalAttempts; attempt++ {
-		err := r.runDatabaseDumpCommand(ctx, database, invocation, outputPath)
+		err := r.runDatabaseDumpCommand(ctx, jobName, database, invocation, outputPath)
 		if err == nil {
 			return nil
 		}
@@ -1746,7 +1785,7 @@ func (r *templateRunner) runDatabaseDumpWithRetry(ctx context.Context, jobName s
 	return lastErr
 }
 
-func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database resolvedDatabaseDumpConfig, invocation databaseDumpInvocation, outputPath string) error {
+func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, jobName string, database resolvedDatabaseDumpConfig, invocation databaseDumpInvocation, outputPath string) error {
 	outputFile, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create dump file %s: %w", outputPath, err)
@@ -1770,14 +1809,15 @@ func (r *templateRunner) runDatabaseDumpCommand(ctx context.Context, database re
 		return runErr
 	}
 
-	cmd := exec.CommandContext(ctx, database.DumpTool, invocation.args...)
+	cmd := exec.Command(database.DumpTool, invocation.args...)
 	cmd.Env = mergeEnv(os.Environ(), invocation.envAdditions)
 	cmd.Stdout = writer
+	setCommandProcessGroup(cmd)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := r.runCommandProcess(ctx, jobName, database.DumpTool, invocation.args, cmd); err != nil {
 		message := strings.TrimSpace(stderr.String())
 		if message != "" {
 			return cleanupOnError(fmt.Errorf("%s %s: %w: %s", database.DumpTool, strings.Join(invocation.args, " "), err, message))
@@ -2019,7 +2059,7 @@ func (r *templateRunner) runResticCommandOutputWithEnv(ctx context.Context, jobN
 }
 
 func (r *templateRunner) runResticCommandWithRecovery(ctx context.Context, jobName string, envAdditions []string, args ...string) ([]byte, error) {
-	output, err := executeCommandWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	output, err := r.executeCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
 	if err == nil {
 		return output, nil
 	}
@@ -2033,7 +2073,7 @@ func (r *templateRunner) runResticCommandWithRecovery(ctx context.Context, jobNa
 		return nil, fmt.Errorf("recover stale restic lock for %s %s: %w", r.cfg.Restic.Binary, strings.Join(args, " "), unlockErr)
 	}
 
-	output, err = executeCommandWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	output, err = r.executeCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
 	if err != nil {
 		return nil, formatCommandError(r.cfg.Restic.Binary, args, output, err)
 	}
@@ -2050,7 +2090,7 @@ func (r *templateRunner) unlockResticStaleLocks(ctx context.Context, jobName str
 	args := append([]string(nil), baseArgs...)
 	args = append(args, "unlock")
 
-	output, err := executeCommandWithEnv(ctx, r.cfg.Restic.Binary, envAdditions, args...)
+	output, err := r.executeCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
 	if len(strings.TrimSpace(string(output))) > 0 {
 		fmt.Fprintf(r.out, "[%s] %s\n", jobName, strings.TrimSpace(string(output)))
 	}
@@ -2338,7 +2378,7 @@ func (w *stackedWriteCloser) Close() error {
 }
 
 func (r *templateRunner) runCommandWithEnv(ctx context.Context, jobName, binary string, envAdditions []string, args ...string) error {
-	output, err := executeCommandWithEnv(ctx, binary, envAdditions, args...)
+	output, err := r.executeCommandWithEnv(ctx, jobName, binary, envAdditions, args...)
 	if len(strings.TrimSpace(string(output))) > 0 {
 		fmt.Fprintf(r.out, "[%s] %s\n", jobName, strings.TrimSpace(string(output)))
 	}
@@ -2350,7 +2390,7 @@ func (r *templateRunner) runCommandWithEnv(ctx context.Context, jobName, binary 
 }
 
 func (r *templateRunner) runCommandOutputWithEnv(ctx context.Context, binary string, envAdditions []string, args ...string) ([]byte, error) {
-	output, err := executeCommandWithEnv(ctx, binary, envAdditions, args...)
+	output, err := r.executeCommandWithEnv(ctx, binary, binary, envAdditions, args...)
 	if err != nil {
 		return nil, formatCommandError(binary, args, output, err)
 	}
@@ -2358,10 +2398,86 @@ func (r *templateRunner) runCommandOutputWithEnv(ctx context.Context, binary str
 	return output, nil
 }
 
-func executeCommandWithEnv(ctx context.Context, binary string, envAdditions []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, binary, args...)
+func (r *templateRunner) executeCommandWithEnv(ctx context.Context, jobName, binary string, envAdditions []string, args ...string) ([]byte, error) {
+	cmd := exec.Command(binary, args...)
 	cmd.Env = mergeEnv(os.Environ(), envAdditions)
-	return cmd.CombinedOutput()
+	setCommandProcessGroup(cmd)
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	err := r.runCommandProcess(ctx, jobName, binary, args, cmd)
+	return output.Bytes(), err
+}
+
+func setCommandProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func (r *templateRunner) runCommandProcess(ctx context.Context, jobName, binary string, args []string, cmd *exec.Cmd) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	startedAt := time.Now()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	pid := cmd.Process.Pid
+	commandLine := formatCommandLine(binary, args)
+	fmt.Fprintf(r.out, "[%s] start process job=%s pid=%d command=%s\n", startedAt.Format(time.RFC3339), jobName, pid, commandLine)
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	var err error
+	select {
+	case err = <-waitCh:
+	case <-ctx.Done():
+		terminateCommandProcessGroup(cmd.Process, syscall.SIGTERM)
+		select {
+		case <-waitCh:
+		case <-time.After(5 * time.Second):
+			terminateCommandProcessGroup(cmd.Process, syscall.SIGKILL)
+			<-waitCh
+		}
+		err = ctx.Err()
+	}
+
+	duration := time.Since(startedAt).Round(time.Millisecond)
+	finishedAt := time.Now().Format(time.RFC3339)
+	if err != nil {
+		fmt.Fprintf(r.errOut, "[%s] fail process job=%s pid=%d duration=%s error=%v command=%s\n", finishedAt, jobName, pid, duration, err, commandLine)
+		return err
+	}
+
+	fmt.Fprintf(r.out, "[%s] finish process job=%s pid=%d duration=%s command=%s\n", finishedAt, jobName, pid, duration, commandLine)
+	return nil
+}
+
+func terminateCommandProcessGroup(process *os.Process, signal syscall.Signal) {
+	if process == nil {
+		return
+	}
+
+	pgid, err := syscall.Getpgid(process.Pid)
+	if err != nil {
+		_ = process.Kill()
+		return
+	}
+
+	_ = syscall.Kill(-pgid, signal)
+}
+
+func formatCommandLine(binary string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, binary)
+	parts = append(parts, args...)
+	return strings.Join(parts, " ")
 }
 
 func formatCommandError(binary string, args []string, output []byte, err error) error {
