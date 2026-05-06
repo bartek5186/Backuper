@@ -157,6 +157,11 @@ type statusBootstrapResult struct {
 	errorByJob       map[string]string
 }
 
+type commandOutput struct {
+	stdout []byte
+	stderr []byte
+}
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -966,6 +971,8 @@ func (s *statusStore) applyBootstrap(jobs []jobConfig, resticRepository string, 
 
 			if message := strings.TrimSpace(result.errorByJob[job.Name]); message != "" {
 				record.LastError = message
+			} else {
+				record.LastError = ""
 			}
 		}
 
@@ -2501,17 +2508,26 @@ func (r *templateRunner) runResticCommandWithEnv(ctx context.Context, jobName st
 }
 
 func (r *templateRunner) runResticCommandOutputWithEnv(ctx context.Context, jobName string, envAdditions []string, args ...string) ([]byte, error) {
-	return r.runResticCommandWithRecovery(ctx, jobName, envAdditions, args...)
+	return r.runResticCommandStdoutWithRecovery(ctx, jobName, envAdditions, args...)
 }
 
 func (r *templateRunner) runResticCommandWithRecovery(ctx context.Context, jobName string, envAdditions []string, args ...string) ([]byte, error) {
-	output, err := r.executeCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
+	return r.runResticCommandWithRecoveryOutput(ctx, jobName, envAdditions, false, args...)
+}
+
+func (r *templateRunner) runResticCommandStdoutWithRecovery(ctx context.Context, jobName string, envAdditions []string, args ...string) ([]byte, error) {
+	return r.runResticCommandWithRecoveryOutput(ctx, jobName, envAdditions, true, args...)
+}
+
+func (r *templateRunner) runResticCommandWithRecoveryOutput(ctx context.Context, jobName string, envAdditions []string, stdoutOnly bool, args ...string) ([]byte, error) {
+	output, err := r.executeCommandWithEnvOutput(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
 	if err == nil {
-		return output, nil
+		return output.bytes(stdoutOnly), nil
 	}
 
-	if ctx.Err() != nil || !isResticLockError(output) {
-		return nil, formatCommandError(r.cfg.Restic.Binary, args, output, err)
+	combinedOutput := output.combined()
+	if ctx.Err() != nil || !isResticLockError(combinedOutput) {
+		return nil, formatCommandError(r.cfg.Restic.Binary, args, combinedOutput, err)
 	}
 
 	fmt.Fprintf(r.out, "[%s] restic lock detected, attempting stale lock cleanup and retry\n", jobName)
@@ -2519,12 +2535,12 @@ func (r *templateRunner) runResticCommandWithRecovery(ctx context.Context, jobNa
 		return nil, fmt.Errorf("recover stale restic lock for %s %s: %w", r.cfg.Restic.Binary, strings.Join(args, " "), unlockErr)
 	}
 
-	output, err = r.executeCommandWithEnv(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
+	output, err = r.executeCommandWithEnvOutput(ctx, jobName, r.cfg.Restic.Binary, envAdditions, args...)
 	if err != nil {
-		return nil, formatCommandError(r.cfg.Restic.Binary, args, output, err)
+		return nil, formatCommandError(r.cfg.Restic.Binary, args, output.combined(), err)
 	}
 
-	return output, nil
+	return output.bytes(stdoutOnly), nil
 }
 
 func (r *templateRunner) unlockResticStaleLocks(ctx context.Context, jobName string) error {
@@ -2845,16 +2861,50 @@ func (r *templateRunner) runCommandOutputWithEnv(ctx context.Context, binary str
 }
 
 func (r *templateRunner) executeCommandWithEnv(ctx context.Context, jobName, binary string, envAdditions []string, args ...string) ([]byte, error) {
+	output, err := r.executeCommandWithEnvOutput(ctx, jobName, binary, envAdditions, args...)
+	return output.combined(), err
+}
+
+func (r *templateRunner) executeCommandWithEnvOutput(ctx context.Context, jobName, binary string, envAdditions []string, args ...string) (commandOutput, error) {
 	cmd := exec.Command(binary, args...)
 	cmd.Env = mergeEnv(os.Environ(), envAdditions)
 	setCommandProcessGroup(cmd)
 
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	err := r.runCommandProcess(ctx, jobName, binary, args, cmd)
-	return output.Bytes(), err
+	return commandOutput{
+		stdout: stdout.Bytes(),
+		stderr: stderr.Bytes(),
+	}, err
+}
+
+func (o commandOutput) combined() []byte {
+	if len(o.stderr) == 0 {
+		return append([]byte(nil), o.stdout...)
+	}
+	if len(o.stdout) == 0 {
+		return append([]byte(nil), o.stderr...)
+	}
+
+	combined := make([]byte, 0, len(o.stdout)+len(o.stderr)+1)
+	combined = append(combined, o.stdout...)
+	if combined[len(combined)-1] != '\n' {
+		combined = append(combined, '\n')
+	}
+	combined = append(combined, o.stderr...)
+	return combined
+}
+
+func (o commandOutput) bytes(stdoutOnly bool) []byte {
+	if stdoutOnly {
+		return append([]byte(nil), o.stdout...)
+	}
+
+	return o.combined()
 }
 
 func setCommandProcessGroup(cmd *exec.Cmd) {

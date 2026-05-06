@@ -807,6 +807,36 @@ func TestHandleResticSnapshotsRejectsNonGET(t *testing.T) {
 	}
 }
 
+func TestListResticSnapshotSummariesIgnoresStderrForJSON(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "secret")
+
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "fake-restic.sh")
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' 'status line on stderr' >&2
+printf '%s\n' '[{"id":"snap1","time":"2026-05-05T06:00:00Z","tags":["uploads"],"paths":["/srv/uploads"]}]'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		Restic: resticConfig{
+			Binary:     binaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+
+	snapshots, err := runner.listResticSnapshotSummaries(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("listResticSnapshotSummaries() error = %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].ID != "snap1" {
+		t.Fatalf("unexpected snapshots: %#v", snapshots)
+	}
+}
+
 func TestHandleHealthReturnsJobsWithBackupStatus(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -1765,6 +1795,50 @@ printf '%s\n' 'dump-content'
 	}
 	if record.LastDurationSeconds <= 0 {
 		t.Fatalf("expected positive duration: %#v", record)
+	}
+}
+
+func TestStatusBootstrapClearsStaleErrorWhenNoSnapshotFound(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "status.json")
+	lastFinished := time.Date(2026, time.May, 5, 6, 0, 0, 0, time.UTC)
+	writeTestStatusFile(t, statusPath, statusFile{
+		UpdatedAt:         lastFinished,
+		ResticRepository:  "/tmp/old-repo",
+		MaxConcurrentJobs: 1,
+		Jobs: []jobStatusRecord{
+			{
+				Name:           "db_job",
+				Type:           "database_dump",
+				LastFinishedAt: &lastFinished,
+				LastError:      "decode restic snapshots JSON: invalid character 's' looking for beginning of value",
+			},
+		},
+	})
+
+	store := newStatusStore(statusPath)
+	now := lastFinished.Add(time.Hour)
+	err := store.applyBootstrap([]jobConfig{{Name: "db_job", Type: "database_dump"}}, "/tmp/restic-repo", 1, statusBootstrapResult{}, now)
+	if err != nil {
+		t.Fatalf("applyBootstrap() error = %v", err)
+	}
+
+	state, err := store.read()
+	if err != nil {
+		t.Fatalf("status.read() error = %v", err)
+	}
+	if len(state.Jobs) != 1 {
+		t.Fatalf("unexpected status jobs: %#v", state.Jobs)
+	}
+	record := state.Jobs[0]
+	if record.LastError != "" {
+		t.Fatalf("expected stale bootstrap error to be cleared: %#v", record)
+	}
+	if record.LastSuccessAt != nil {
+		t.Fatalf("did not expect a successful backup timestamp: %#v", record)
+	}
+	if !state.UpdatedAt.Equal(now) {
+		t.Fatalf("unexpected updated_at: got %s, want %s", state.UpdatedAt, now)
 	}
 }
 
