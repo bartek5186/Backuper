@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,21 @@ import (
 	"testing"
 	"time"
 )
+
+func writeTestStatusFile(t *testing.T, path string, state statusFile) {
+	t.Helper()
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
 
 func TestLoadConfigSupportsDatabaseDefaultsAndJobSpecificConnections(t *testing.T) {
 	dir := t.TempDir()
@@ -792,52 +808,29 @@ func TestHandleResticSnapshotsRejectsNonGET(t *testing.T) {
 }
 
 func TestHandleHealthReturnsJobsWithBackupStatus(t *testing.T) {
-	t.Setenv(resticPasswordEnv, "secret")
 	now := time.Now().UTC().Truncate(time.Second)
 
 	dir := t.TempDir()
-	previousWD, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd() error = %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Chdir() error = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(previousWD)
+	statusPath := filepath.Join(dir, "status.json")
+	dbLastSuccess := now.Add(-90 * time.Minute)
+	resticLastSuccess := now.Add(-time.Hour)
+	writeTestStatusFile(t, statusPath, statusFile{
+		UpdatedAt:         now,
+		ResticRepository:  "/tmp/restic-repo",
+		MaxConcurrentJobs: 1,
+		Jobs: []jobStatusRecord{
+			{Name: "db_job", Type: "database_dump", LastSuccessAt: &dbLastSuccess, LastFinishedAt: &dbLastSuccess},
+			{Name: "restic_job", Type: "restic_backup", LastSuccessAt: &resticLastSuccess, LastFinishedAt: &resticLastSuccess},
+		},
 	})
-
-	dumpDir := filepath.Join(dir, "backups", "db_job")
-	if err := os.MkdirAll(dumpDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll() error = %v", err)
-	}
-	dumpPath := filepath.Join(dumpDir, "db_job_2026-04-10_12-00-00.sql.gz")
-	dumpTime := now.Add(-2 * time.Hour)
-	if err := os.WriteFile(dumpPath, []byte("dump"), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-	if err := os.Chtimes(dumpPath, dumpTime, dumpTime); err != nil {
-		t.Fatalf("Chtimes() error = %v", err)
-	}
-
-	argsPath := filepath.Join(dir, "args.txt")
-	binaryPath := filepath.Join(dir, "fake-restic.sh")
-	t.Setenv("TEST_ARGS_FILE", argsPath)
-	script := `#!/usr/bin/env bash
-set -eu
-printf '%s ' "$@" >> "$TEST_ARGS_FILE"
-printf '\n' >> "$TEST_ARGS_FILE"
-printf '%s\n' '[{"id":"dbsnap","time":"` + now.Add(-90*time.Minute).Format(time.RFC3339) + `","tags":["db_job"],"paths":["/tmp/ignored"]},{"id":"snap1","time":"` + now.Add(-time.Hour).Format(time.RFC3339) + `","tags":["uploads"],"paths":["/tmp/ignored"]}]'
-`
-	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
 
 	enabled := true
 	runner := newTemplateRunner(config{
+		App: appConfig{
+			StatusFile: statusPath,
+		},
 		Database: databaseConfigList{{Type: "mariadb", Restic: &enabled}},
 		Restic: resticConfig{
-			Binary:     binaryPath,
 			Repository: "/tmp/restic-repo",
 		},
 	}, os.Stdout, os.Stderr)
@@ -874,56 +867,40 @@ printf '%s\n' '[{"id":"dbsnap","time":"` + now.Add(-90*time.Minute).Format(time.
 	if response.Jobs[0].Name != "db_job" || !response.Jobs[0].Healthy || response.Jobs[0].LastSuccessAt == nil {
 		t.Fatalf("unexpected first job status: %#v", response.Jobs[0])
 	}
-	if !response.Jobs[0].LastSuccessAt.UTC().Equal(now.Add(-90 * time.Minute)) {
+	if !response.Jobs[0].LastSuccessAt.UTC().Equal(dbLastSuccess) {
 		t.Fatalf("unexpected db last success: %#v", response.Jobs[0].LastSuccessAt)
 	}
 	if response.Jobs[1].Name != "restic_job" || !response.Jobs[1].Healthy || response.Jobs[1].LastSuccessAt == nil {
 		t.Fatalf("unexpected second job status: %#v", response.Jobs[1])
 	}
-	if !response.Jobs[1].LastSuccessAt.UTC().Equal(now.Add(-time.Hour)) {
+	if !response.Jobs[1].LastSuccessAt.UTC().Equal(resticLastSuccess) {
 		t.Fatalf("unexpected restic last success: %#v", response.Jobs[1].LastSuccessAt)
 	}
 	if response.Jobs[0].Error != "" || response.Jobs[1].Error != "" {
 		t.Fatalf("unexpected errors in health response: %#v", response.Jobs)
 	}
-
-	argsBytes, err := os.ReadFile(argsPath)
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	args := strings.Fields(string(argsBytes))
-	expectedArgs := []string{"-r", "/tmp/restic-repo", "snapshots", "--json"}
-	if len(args) != len(expectedArgs) {
-		t.Fatalf("unexpected restic args: got %#v, want %#v", args, expectedArgs)
-	}
-	for i := range expectedArgs {
-		if args[i] != expectedArgs[i] {
-			t.Fatalf("unexpected restic args: got %#v, want %#v", args, expectedArgs)
-		}
-	}
 }
 
-func TestHandleHealthReturnsFalseForStaleSnapshots(t *testing.T) {
-	t.Setenv(resticPasswordEnv, "secret")
+func TestHandleHealthReturnsFalseForStalePassiveStatus(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 
 	dir := t.TempDir()
-	argsPath := filepath.Join(dir, "args.txt")
-	binaryPath := filepath.Join(dir, "fake-restic.sh")
-	t.Setenv("TEST_ARGS_FILE", argsPath)
-	script := `#!/usr/bin/env bash
-set -eu
-printf '%s ' "$@" >> "$TEST_ARGS_FILE"
-printf '\n' >> "$TEST_ARGS_FILE"
-printf '%s\n' '[{"id":"snap1","time":"` + now.Add(-25*time.Hour).Format(time.RFC3339) + `","tags":["uploads"],"paths":["/data/uploads"]}]'
-`
-	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
+	statusPath := filepath.Join(dir, "status.json")
+	lastSuccess := now.Add(-25 * time.Hour)
+	writeTestStatusFile(t, statusPath, statusFile{
+		UpdatedAt:         now,
+		ResticRepository:  "/tmp/restic-repo",
+		MaxConcurrentJobs: 1,
+		Jobs: []jobStatusRecord{
+			{Name: "restic_job", Type: "restic_backup", LastSuccessAt: &lastSuccess, LastFinishedAt: &lastSuccess},
+		},
+	})
 
 	runner := newTemplateRunner(config{
+		App: appConfig{
+			StatusFile: statusPath,
+		},
 		Restic: resticConfig{
-			Binary:     binaryPath,
 			Repository: "/tmp/restic-repo",
 		},
 	}, os.Stdout, os.Stderr)
@@ -977,18 +954,34 @@ func TestHandleHealthRejectsNonGET(t *testing.T) {
 	}
 }
 
-func TestWritePrometheusMetricsIncludesHealthAndResticMetrics(t *testing.T) {
-	t.Setenv(resticPasswordEnv, "secret")
-
+func TestWritePrometheusMetricsUsesPassiveStatusFile(t *testing.T) {
 	now := time.Date(2026, time.May, 5, 7, 0, 0, 0, time.UTC)
-	latestSnapshotAt := now.Add(-time.Hour)
-	oldSnapshotAt := now.Add(-2 * time.Hour)
-
 	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "status.json")
+	resticCalledPath := filepath.Join(dir, "restic-called.txt")
 	binaryPath := filepath.Join(dir, "fake-restic.sh")
+	lastSuccess := now.Add(-time.Hour)
+	statusUpdatedAt := now.Add(-time.Minute)
+	writeTestStatusFile(t, statusPath, statusFile{
+		UpdatedAt:         statusUpdatedAt,
+		ResticRepository:  "sftp://footballmat@warehouse:9990//backups/footballmat",
+		MaxConcurrentJobs: 1,
+		Jobs: []jobStatusRecord{
+			{
+				Name:                "footballmat_data",
+				Type:                "restic_backup",
+				LastSuccessAt:       &lastSuccess,
+				LastFinishedAt:      &lastSuccess,
+				LastDurationSeconds: 12.5,
+			},
+		},
+	})
+
+	t.Setenv("TEST_RESTIC_CALLED_FILE", resticCalledPath)
 	script := `#!/usr/bin/env bash
 set -eu
-printf '%s\n' '[{"id":"latest","time":"` + latestSnapshotAt.Format(time.RFC3339) + `","tags":["data"],"paths":["/srv/data"]},{"id":"old","time":"` + oldSnapshotAt.Format(time.RFC3339) + `","tags":["data"],"paths":["/srv/data"]}]'
+printf called > "$TEST_RESTIC_CALLED_FILE"
+exit 99
 `
 	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
@@ -998,6 +991,7 @@ printf '%s\n' '[{"id":"latest","time":"` + latestSnapshotAt.Format(time.RFC3339)
 	runner := newTemplateRunner(config{
 		App: appConfig{
 			MaxConcurrentJobs: 1,
+			StatusFile:        statusPath,
 		},
 		Restic: resticConfig{
 			Binary:     binaryPath,
@@ -1021,26 +1015,32 @@ printf '%s\n' '[{"id":"latest","time":"` + latestSnapshotAt.Format(time.RFC3339)
 	if err := server.writePrometheusMetrics(context.Background(), &output, now); err != nil {
 		t.Fatalf("writePrometheusMetrics() error = %v", err)
 	}
+	if _, err := os.Stat(resticCalledPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected passive metrics not to execute restic, stat err = %v", err)
+	}
 
 	body := output.String()
 	wantFragments := []string{
-		`backuper_metrics_collection_success{collector="health"} 1`,
-		`backuper_metrics_collection_success{collector="restic"} 1`,
+		`backuper_metrics_collection_success{collector="status_file"} 1`,
+		`backuper_status_file_updated_timestamp_seconds ` + strconv.FormatInt(statusUpdatedAt.Unix(), 10),
 		`backuper_jobs_configured_total 1`,
 		`backuper_max_concurrent_jobs 1`,
 		`backuper_job_configured{name="footballmat_data",type="restic_backup"} 1`,
 		`backuper_job_healthy{name="footballmat_data",type="restic_backup"} 1`,
 		`backuper_job_error{name="footballmat_data",type="restic_backup"} 0`,
-		`backuper_job_last_success_timestamp_seconds{name="footballmat_data",type="restic_backup"} ` + strconv.FormatInt(latestSnapshotAt.Unix(), 10),
+		`backuper_job_running{name="footballmat_data",type="restic_backup"} 0`,
+		`backuper_job_last_success_timestamp_seconds{name="footballmat_data",type="restic_backup"} ` + strconv.FormatInt(lastSuccess.Unix(), 10),
 		`backuper_job_last_success_age_seconds{name="footballmat_data",type="restic_backup"} 3600`,
-		`backuper_restic_snapshots_total{repository="` + repository + `"} 2`,
-		`backuper_restic_latest_snapshot_timestamp_seconds{repository="` + repository + `"} ` + strconv.FormatInt(latestSnapshotAt.Unix(), 10),
-		`backuper_restic_latest_snapshot_age_seconds{repository="` + repository + `"} 3600`,
+		`backuper_job_last_duration_seconds{name="footballmat_data",type="restic_backup"} 12.5`,
+		`backuper_restic_repository_configured{repository="` + repository + `"} 1`,
 	}
 	for _, fragment := range wantFragments {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("expected metrics output containing %q, got:\n%s", fragment, body)
 		}
+	}
+	if strings.Contains(body, "backuper_restic_snapshots_total") {
+		t.Fatalf("passive metrics must not expose live restic snapshot totals, got:\n%s", body)
 	}
 }
 
@@ -1496,6 +1496,7 @@ printf '%s\n' 'dump-content'
 	runner := newTemplateRunner(config{
 		App: appConfig{
 			MaxConcurrentJobs: 1,
+			StatusFile:        filepath.Join(dir, "status.json"),
 		},
 		Database: databaseConfigList{{
 			Type: "mariadb",
@@ -1570,6 +1571,7 @@ printf '%s\n' 'dump-content'
 	runner := newTemplateRunner(config{
 		App: appConfig{
 			MaxConcurrentJobs: 2,
+			StatusFile:        filepath.Join(dir, "status.json"),
 		},
 		Database: databaseConfigList{{
 			Type: "mariadb",
@@ -1599,6 +1601,71 @@ printf '%s\n' 'dump-content'
 	}
 	if strings.TrimSpace(string(attemptBytes)) != "1" {
 		t.Fatalf("expected one command attempt for duplicate running job, got %q", string(attemptBytes))
+	}
+}
+
+func TestTemplateRunnerWritesPassiveStatusFile(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "mariadb-dump")
+	statusPath := filepath.Join(dir, "status.json")
+	t.Setenv("BACKUP_DB_PASSWORD", "secret")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' 'dump-content'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runner := newTemplateRunner(config{
+		App: appConfig{
+			MaxConcurrentJobs: 1,
+			StatusFile:        statusPath,
+		},
+		Database: databaseConfigList{{
+			Type: "mariadb",
+		}},
+	}, os.Stdout, os.Stderr)
+
+	job := jobConfig{
+		Name:           "db_job",
+		Type:           "database_dump",
+		TimeoutMinutes: 1,
+		DatabaseName:   "myapp",
+		Host:           "127.0.0.1",
+		Port:           3306,
+		User:           "backup_user",
+		Password:       "BACKUP_DB_PASSWORD",
+		OutputDir:      filepath.Join(dir, "dump"),
+	}
+
+	runner.launchJob(context.Background(), job, time.Now())
+	runner.Wait()
+
+	state, err := runner.status.read()
+	if err != nil {
+		t.Fatalf("status.read() error = %v", err)
+	}
+	if len(state.Jobs) != 1 {
+		t.Fatalf("unexpected status jobs: %#v", state.Jobs)
+	}
+	record := state.Jobs[0]
+	if record.Name != "db_job" || record.Type != "database_dump" {
+		t.Fatalf("unexpected status record: %#v", record)
+	}
+	if record.Running {
+		t.Fatalf("expected completed job to be marked not running: %#v", record)
+	}
+	if record.LastSuccessAt == nil || record.LastFinishedAt == nil || record.LastStartedAt == nil {
+		t.Fatalf("expected timestamps to be written: %#v", record)
+	}
+	if record.LastError != "" {
+		t.Fatalf("unexpected status error: %#v", record)
+	}
+	if record.LastDurationSeconds <= 0 {
+		t.Fatalf("expected positive duration: %#v", record)
 	}
 }
 

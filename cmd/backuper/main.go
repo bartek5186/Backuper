@@ -39,6 +39,7 @@ const (
 	defaultAPIRequestTimeout  = 30 * time.Second
 	defaultHealthMaxAge       = 24 * time.Hour
 	defaultMaxConcurrentJobs  = 1
+	defaultStatusFilePath     = "./backups/backuper_status.json"
 )
 
 const defaultDatabaseConfigName = "default"
@@ -109,13 +110,6 @@ type healthResponse struct {
 	Jobs []jobHealthStatus `json:"jobs"`
 }
 
-type jobHealthCollection struct {
-	Statuses       []jobHealthStatus
-	Snapshots      []resticSnapshotSummary
-	NeedsSnapshots bool
-	ResticError    error
-}
-
 type resticSnapshotSummary struct {
 	ID      string    `json:"id"`
 	ShortID string    `json:"short_id,omitempty"`
@@ -133,6 +127,29 @@ type apiServer struct {
 	jobs   []jobConfig
 	out    *os.File
 	errOut *os.File
+}
+
+type statusFile struct {
+	UpdatedAt         time.Time         `json:"updated_at"`
+	ResticRepository  string            `json:"restic_repository,omitempty"`
+	MaxConcurrentJobs int               `json:"max_concurrent_jobs"`
+	Jobs              []jobStatusRecord `json:"jobs"`
+}
+
+type jobStatusRecord struct {
+	Name                string     `json:"name"`
+	Type                string     `json:"type"`
+	Running             bool       `json:"running"`
+	LastStartedAt       *time.Time `json:"last_started_at,omitempty"`
+	LastFinishedAt      *time.Time `json:"last_finished_at,omitempty"`
+	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
+	LastDurationSeconds float64    `json:"last_duration_seconds,omitempty"`
+	LastError           string     `json:"last_error,omitempty"`
+}
+
+type statusStore struct {
+	path string
+	mu   sync.Mutex
 }
 
 func main() {
@@ -275,6 +292,7 @@ func runServe(args []string) int {
 	}
 
 	runner := newTemplateRunner(cfg, os.Stdout, os.Stderr)
+	runner.ensureStatusFile(selectedJobs)
 	api := newAPIServerWithRunner(runner, selectedJobs, os.Stdout, os.Stderr)
 	httpServer := &http.Server{
 		Addr:    *listenAddress,
@@ -431,6 +449,7 @@ func runAPI(args []string) int {
 	}
 
 	server := newAPIServer(cfg, os.Stdout, os.Stderr)
+	server.runner.ensureStatusFile(cfg.Jobs)
 	httpServer := &http.Server{
 		Addr:    *listenAddress,
 		Handler: server.routes(),
@@ -517,6 +536,7 @@ func runScheduler(args []string) int {
 	}
 
 	runner := newTemplateRunner(cfg, os.Stdout, os.Stderr)
+	runner.ensureStatusFile(selectedJobs)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -550,6 +570,7 @@ type appConfig struct {
 	Name              string `json:"name"`
 	Timezone          string `json:"timezone"`
 	MaxConcurrentJobs int    `json:"max_concurrent_jobs,omitempty"`
+	StatusFile        string `json:"status_file,omitempty"`
 }
 
 type pathsConfig struct {
@@ -621,6 +642,7 @@ type templateRunner struct {
 	running  map[string]struct{}
 	wg       sync.WaitGroup
 	jobSlots chan struct{}
+	status   *statusStore
 	sleep    func(context.Context, time.Duration) error
 }
 
@@ -845,6 +867,7 @@ func newTemplateRunner(cfg config, out, errOut *os.File) *templateRunner {
 		errOut:   errOut,
 		running:  make(map[string]struct{}),
 		jobSlots: make(chan struct{}, maxConcurrentJobs),
+		status:   newStatusStore(effectiveStatusFilePath(cfg.App.StatusFile)),
 		sleep:    sleepWithContext,
 	}
 }
@@ -855,6 +878,165 @@ func effectiveMaxConcurrentJobs(configured int) int {
 	}
 
 	return defaultMaxConcurrentJobs
+}
+
+func effectiveStatusFilePath(configured string) string {
+	if strings.TrimSpace(configured) != "" {
+		return configured
+	}
+
+	return defaultStatusFilePath
+}
+
+func newStatusStore(path string) *statusStore {
+	return &statusStore{path: path}
+}
+
+func (s *statusStore) read() (statusFile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.readLocked()
+}
+
+func (s *statusStore) ensureJobs(jobs []jobConfig, resticRepository string, maxConcurrentJobs int, now time.Time) error {
+	return s.update(func(state *statusFile) {
+		state.ResticRepository = resticRepository
+		state.MaxConcurrentJobs = maxConcurrentJobs
+		mergeConfiguredJobs(state, jobs)
+		state.UpdatedAt = now
+	})
+}
+
+func (s *statusStore) markJobStarted(job jobConfig, startedAt time.Time) error {
+	return s.update(func(state *statusFile) {
+		record := statusRecordForJob(state, job)
+		record.Type = job.Type
+		record.Running = true
+		record.LastStartedAt = timePtr(startedAt)
+		record.LastError = ""
+		state.UpdatedAt = startedAt
+	})
+}
+
+func (s *statusStore) markJobFinished(job jobConfig, finishedAt time.Time, duration time.Duration, runErr error) error {
+	return s.update(func(state *statusFile) {
+		record := statusRecordForJob(state, job)
+		record.Type = job.Type
+		record.Running = false
+		record.LastFinishedAt = timePtr(finishedAt)
+		record.LastDurationSeconds = duration.Seconds()
+		if runErr != nil {
+			record.LastError = runErr.Error()
+		} else {
+			record.LastSuccessAt = timePtr(finishedAt)
+			record.LastError = ""
+		}
+		state.UpdatedAt = finishedAt
+	})
+}
+
+func (s *statusStore) update(updateFn func(*statusFile)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, err := s.readExistingLocked()
+	if err != nil {
+		return err
+	}
+
+	updateFn(&state)
+	return s.writeLocked(state)
+}
+
+func (s *statusStore) readExistingLocked() (statusFile, error) {
+	state, err := s.readLocked()
+	if errors.Is(err, os.ErrNotExist) {
+		return statusFile{}, nil
+	}
+
+	return state, err
+}
+
+func (s *statusStore) readLocked() (statusFile, error) {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return statusFile{}, err
+	}
+
+	var state statusFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		return statusFile{}, fmt.Errorf("decode status file %s: %w", s.path, err)
+	}
+
+	return state, nil
+}
+
+func (s *statusStore) writeLocked(state statusFile) error {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create status file dir %s: %w", dir, err)
+	}
+
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(s.path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary status file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	encoder := json.NewEncoder(tmpFile)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(state); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("encode status file %s: %w", tmpPath, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close status file %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("replace status file %s: %w", s.path, err)
+	}
+
+	return nil
+}
+
+func mergeConfiguredJobs(state *statusFile, jobs []jobConfig) {
+	indexByName := make(map[string]int, len(state.Jobs))
+	for i, record := range state.Jobs {
+		indexByName[record.Name] = i
+	}
+
+	for _, job := range jobs {
+		if index, ok := indexByName[job.Name]; ok {
+			state.Jobs[index].Type = job.Type
+			continue
+		}
+
+		indexByName[job.Name] = len(state.Jobs)
+		state.Jobs = append(state.Jobs, jobStatusRecord{
+			Name: job.Name,
+			Type: job.Type,
+		})
+	}
+}
+
+func statusRecordForJob(state *statusFile, job jobConfig) *jobStatusRecord {
+	for i := range state.Jobs {
+		if state.Jobs[i].Name == job.Name {
+			return &state.Jobs[i]
+		}
+	}
+
+	state.Jobs = append(state.Jobs, jobStatusRecord{
+		Name: job.Name,
+		Type: job.Type,
+	})
+	return &state.Jobs[len(state.Jobs)-1]
+}
+
+func timePtr(value time.Time) *time.Time {
+	return &value
 }
 
 func newAPIServer(cfg config, out, errOut *os.File) *apiServer {
@@ -936,136 +1118,36 @@ func (s *apiServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiServer) collectJobHealthStatuses(ctx context.Context) ([]jobHealthStatus, error) {
-	collection, err := s.collectJobHealth(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return collection.Statuses, nil
-}
-
-func (s *apiServer) collectJobHealth(ctx context.Context) (jobHealthCollection, error) {
-	statuses := make([]jobHealthStatus, 0, len(s.jobs))
-	now := time.Now()
-	dbJobUsesRestic := make(map[string]bool, len(s.jobs))
-	jobConfigErrors := make(map[string]string)
-
-	needsSnapshots := hasJobType(s.jobs, "restic_backup")
-	for _, job := range s.jobs {
-		if job.Type != "database_dump" {
-			continue
-		}
-
-		useRestic, err := s.runner.cfg.databaseResticEnabledForJob(job)
-		if err != nil {
-			jobConfigErrors[job.Name] = err.Error()
-			continue
-		}
-
-		dbJobUsesRestic[job.Name] = useRestic
-		if useRestic {
-			needsSnapshots = true
-		}
-	}
-
-	var (
-		snapshots   []resticSnapshotSummary
-		resticError error
-	)
-	if needsSnapshots {
-		snapshots, resticError = s.runner.listResticSnapshotSummaries(ctx, nil)
-	}
-
-	for _, job := range s.jobs {
-		status := jobHealthStatus{Name: job.Name}
-		if message, ok := jobConfigErrors[job.Name]; ok {
-			status.Error = message
-			statuses = append(statuses, status)
-			continue
-		}
-
-		switch job.Type {
-		case "database_dump":
-			if dbJobUsesRestic[job.Name] {
-				if resticError != nil {
-					status.Error = resticError.Error()
-					break
-				}
-
-				lastSuccessAt, err := latestDatabaseDumpResticSuccess(job, snapshots)
-				if err != nil {
-					status.Error = err.Error()
-					break
-				}
-				if lastSuccessAt != nil {
-					status.LastSuccessAt = lastSuccessAt
-					status.Healthy = successIsFresh(*lastSuccessAt, now, defaultHealthMaxAge)
-				}
-				break
-			}
-
-			lastSuccessAt, err := latestDatabaseDumpSuccess(job)
-			if err != nil {
-				status.Error = err.Error()
-				break
-			}
-			if lastSuccessAt != nil {
-				status.LastSuccessAt = lastSuccessAt
-				status.Healthy = successIsFresh(*lastSuccessAt, now, defaultHealthMaxAge)
-			}
-		case "restic_backup":
-			if resticError != nil {
-				status.Error = resticError.Error()
-				break
-			}
-
-			lastSuccessAt, err := latestResticJobSuccess(job, snapshots)
-			if err != nil {
-				status.Error = err.Error()
-				break
-			}
-			if lastSuccessAt != nil {
-				status.LastSuccessAt = lastSuccessAt
-				status.Healthy = successIsFresh(*lastSuccessAt, now, defaultHealthMaxAge)
-			}
-		default:
-			status.Error = fmt.Sprintf("unsupported job type %q", job.Type)
-		}
-
-		statuses = append(statuses, status)
-	}
-
-	return jobHealthCollection{
-		Statuses:       statuses,
-		Snapshots:      snapshots,
-		NeedsSnapshots: needsSnapshots,
-		ResticError:    resticError,
-	}, nil
+	statuses, _, _, _ := s.collectPassiveJobHealth(time.Now())
+	return statuses, nil
 }
 
 func (s *apiServer) writePrometheusMetrics(ctx context.Context, out io.Writer, now time.Time) error {
-	collection, err := s.collectJobHealth(ctx)
-	healthCollectionOK := err == nil
-	if err != nil {
-		collection.Statuses = nil
-	}
+	statuses, state, statusFileOK, statusFileErr := s.collectPassiveJobHealth(now)
 
 	jobTypes := make(map[string]string, len(s.jobs))
 	for _, job := range s.jobs {
 		jobTypes[job.Name] = job.Type
 	}
+	statusRecords := statusRecordsByName(state)
 
 	fmt.Fprintln(out, "# HELP backuper_metrics_collection_success Whether a metrics collector completed successfully.")
 	fmt.Fprintln(out, "# TYPE backuper_metrics_collection_success gauge")
-	writeGauge(out, "backuper_metrics_collection_success", map[string]string{"collector": "health"}, boolFloat(healthCollectionOK))
+	writeGauge(out, "backuper_metrics_collection_success", map[string]string{"collector": "status_file"}, boolFloat(statusFileOK))
+
+	fmt.Fprintln(out, "# HELP backuper_status_file_updated_timestamp_seconds Unix timestamp of the last status file update.")
+	fmt.Fprintln(out, "# TYPE backuper_status_file_updated_timestamp_seconds gauge")
+	if statusFileOK && !state.UpdatedAt.IsZero() {
+		writeGauge(out, "backuper_status_file_updated_timestamp_seconds", nil, float64(state.UpdatedAt.Unix()))
+	}
 
 	fmt.Fprintln(out, "# HELP backuper_jobs_configured_total Number of configured backuper jobs.")
 	fmt.Fprintln(out, "# TYPE backuper_jobs_configured_total gauge")
 	writeGauge(out, "backuper_jobs_configured_total", nil, float64(len(s.jobs)))
 
-	fmt.Fprintln(out, "# HELP backuper_jobs_running Number of currently running or queued backuper jobs.")
+	fmt.Fprintln(out, "# HELP backuper_jobs_running Number of currently running backuper jobs according to the passive status file.")
 	fmt.Fprintln(out, "# TYPE backuper_jobs_running gauge")
-	writeGauge(out, "backuper_jobs_running", nil, float64(s.runner.runningJobCount()))
+	writeGauge(out, "backuper_jobs_running", nil, float64(runningJobCountFromStatusFile(state, s.jobs)))
 
 	fmt.Fprintln(out, "# HELP backuper_max_concurrent_jobs Maximum number of backup jobs allowed to run concurrently.")
 	fmt.Fprintln(out, "# TYPE backuper_max_concurrent_jobs gauge")
@@ -1081,84 +1163,111 @@ func (s *apiServer) writePrometheusMetrics(ctx context.Context, out io.Writer, n
 	fmt.Fprintln(out, "# TYPE backuper_job_healthy gauge")
 	fmt.Fprintln(out, "# HELP backuper_job_error Whether a backuper job currently reports an error.")
 	fmt.Fprintln(out, "# TYPE backuper_job_error gauge")
+	fmt.Fprintln(out, "# HELP backuper_job_running Whether a backuper job is currently running according to the passive status file.")
+	fmt.Fprintln(out, "# TYPE backuper_job_running gauge")
 	fmt.Fprintln(out, "# HELP backuper_job_last_success_timestamp_seconds Unix timestamp of the latest successful backup for a job.")
 	fmt.Fprintln(out, "# TYPE backuper_job_last_success_timestamp_seconds gauge")
 	fmt.Fprintln(out, "# HELP backuper_job_last_success_age_seconds Age in seconds of the latest successful backup for a job.")
 	fmt.Fprintln(out, "# TYPE backuper_job_last_success_age_seconds gauge")
-	for _, status := range collection.Statuses {
+	fmt.Fprintln(out, "# HELP backuper_job_last_duration_seconds Duration in seconds of the latest completed backup for a job.")
+	fmt.Fprintln(out, "# TYPE backuper_job_last_duration_seconds gauge")
+	for _, status := range statuses {
 		labels := jobMetricLabels(status.Name, jobTypes[status.Name])
 		writeGauge(out, "backuper_job_healthy", labels, boolFloat(status.Healthy))
 		writeGauge(out, "backuper_job_error", labels, boolFloat(status.Error != ""))
+		if record, ok := statusRecords[status.Name]; ok {
+			writeGauge(out, "backuper_job_running", labels, boolFloat(record.Running))
+			if record.LastDurationSeconds > 0 {
+				writeGauge(out, "backuper_job_last_duration_seconds", labels, record.LastDurationSeconds)
+			}
+		} else {
+			writeGauge(out, "backuper_job_running", labels, 0)
+		}
 		if status.LastSuccessAt != nil {
 			writeGauge(out, "backuper_job_last_success_timestamp_seconds", labels, float64(status.LastSuccessAt.Unix()))
 			writeGauge(out, "backuper_job_last_success_age_seconds", labels, now.Sub(*status.LastSuccessAt).Seconds())
 		}
 	}
 
-	snapshots, resticErr := s.metricsResticSnapshots(ctx, collection)
-	resticOK := resticErr == nil
-	writeGauge(out, "backuper_metrics_collection_success", map[string]string{"collector": "restic"}, boolFloat(resticOK))
-	if shouldCollectResticMetrics(s.runner.cfg.Restic) {
-		repositoryLabels := map[string]string{"repository": s.runner.cfg.Restic.Repository}
+	if strings.TrimSpace(s.runner.cfg.Restic.Repository) != "" {
+		fmt.Fprintln(out, "# HELP backuper_restic_repository_configured Configured restic repository metadata. This metric is passive and does not query restic.")
+		fmt.Fprintln(out, "# TYPE backuper_restic_repository_configured gauge")
+		writeGauge(out, "backuper_restic_repository_configured", map[string]string{"repository": s.runner.cfg.Restic.Repository}, 1)
+	}
 
-		fmt.Fprintln(out, "# HELP backuper_restic_snapshots_total Number of restic snapshots in the configured repository.")
-		fmt.Fprintln(out, "# TYPE backuper_restic_snapshots_total gauge")
-		writeGauge(out, "backuper_restic_snapshots_total", repositoryLabels, float64(len(snapshots)))
+	return statusFileErr
+}
 
-		if latest, ok := latestResticSnapshotTime(snapshots); ok {
-			fmt.Fprintln(out, "# HELP backuper_restic_latest_snapshot_timestamp_seconds Unix timestamp of the newest restic snapshot.")
-			fmt.Fprintln(out, "# TYPE backuper_restic_latest_snapshot_timestamp_seconds gauge")
-			writeGauge(out, "backuper_restic_latest_snapshot_timestamp_seconds", repositoryLabels, float64(latest.Unix()))
+func (s *apiServer) collectPassiveJobHealth(now time.Time) ([]jobHealthStatus, statusFile, bool, error) {
+	state, err := s.runner.status.read()
+	if err != nil {
+		return statusReadErrorStatuses(s.jobs, err), statusFile{}, false, err
+	}
 
-			fmt.Fprintln(out, "# HELP backuper_restic_latest_snapshot_age_seconds Age in seconds of the newest restic snapshot.")
-			fmt.Fprintln(out, "# TYPE backuper_restic_latest_snapshot_age_seconds gauge")
-			writeGauge(out, "backuper_restic_latest_snapshot_age_seconds", repositoryLabels, now.Sub(latest).Seconds())
+	return jobHealthStatusesFromStatusFile(s.jobs, state, now), state, true, nil
+}
+
+func statusReadErrorStatuses(jobs []jobConfig, err error) []jobHealthStatus {
+	statuses := make([]jobHealthStatus, 0, len(jobs))
+	for _, job := range jobs {
+		statuses = append(statuses, jobHealthStatus{
+			Name:  job.Name,
+			Error: fmt.Sprintf("read passive status file: %v", err),
+		})
+	}
+
+	return statuses
+}
+
+func jobHealthStatusesFromStatusFile(jobs []jobConfig, state statusFile, now time.Time) []jobHealthStatus {
+	records := statusRecordsByName(state)
+	statuses := make([]jobHealthStatus, 0, len(jobs))
+	for _, job := range jobs {
+		record, ok := records[job.Name]
+		if !ok {
+			statuses = append(statuses, jobHealthStatus{
+				Name:  job.Name,
+				Error: "job has no passive status yet",
+			})
+			continue
+		}
+
+		status := jobHealthStatus{
+			Name:          job.Name,
+			LastSuccessAt: record.LastSuccessAt,
+		}
+		if record.LastError != "" {
+			status.Error = record.LastError
+		}
+		if record.LastError == "" && record.LastSuccessAt != nil {
+			status.Healthy = successIsFresh(*record.LastSuccessAt, now, defaultHealthMaxAge)
+		}
+
+		statuses = append(statuses, status)
+	}
+
+	return statuses
+}
+
+func statusRecordsByName(state statusFile) map[string]jobStatusRecord {
+	records := make(map[string]jobStatusRecord, len(state.Jobs))
+	for _, record := range state.Jobs {
+		records[record.Name] = record
+	}
+
+	return records
+}
+
+func runningJobCountFromStatusFile(state statusFile, jobs []jobConfig) int {
+	records := statusRecordsByName(state)
+	count := 0
+	for _, job := range jobs {
+		if records[job.Name].Running {
+			count++
 		}
 	}
 
-	if err != nil {
-		return err
-	}
-	if resticErr != nil {
-		return resticErr
-	}
-
-	return nil
-}
-
-func (s *apiServer) metricsResticSnapshots(ctx context.Context, collection jobHealthCollection) ([]resticSnapshotSummary, error) {
-	if !shouldCollectResticMetrics(s.runner.cfg.Restic) {
-		return nil, nil
-	}
-	if collection.NeedsSnapshots {
-		return collection.Snapshots, collection.ResticError
-	}
-
-	snapshots, err := s.runner.listResticSnapshotSummaries(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return snapshots, nil
-}
-
-func shouldCollectResticMetrics(restic resticConfig) bool {
-	return strings.TrimSpace(restic.Binary) != "" && strings.TrimSpace(restic.Repository) != ""
-}
-
-func latestResticSnapshotTime(snapshots []resticSnapshotSummary) (time.Time, bool) {
-	if len(snapshots) == 0 {
-		return time.Time{}, false
-	}
-
-	latest := snapshots[0].Time
-	for _, snapshot := range snapshots[1:] {
-		if snapshot.Time.After(latest) {
-			latest = snapshot.Time
-		}
-	}
-
-	return latest, true
+	return count
 }
 
 func jobMetricLabels(name, jobType string) map[string]string {
@@ -1815,6 +1924,12 @@ func (r *templateRunner) dispatchSelectedJobs(ctx context.Context, jobs []jobCon
 	}
 }
 
+func (r *templateRunner) ensureStatusFile(jobs []jobConfig) {
+	if err := r.status.ensureJobs(jobs, r.cfg.Restic.Repository, cap(r.jobSlots), time.Now()); err != nil {
+		fmt.Fprintf(r.errOut, "status file update failed: %v\n", err)
+	}
+}
+
 func runContinuousScheduler(ctx context.Context, runner *templateRunner, jobs []jobConfig, location *time.Location) {
 	fmt.Fprintf(runner.out, "runner started for %d jobs in timezone %s with max_concurrent_jobs=%d\n", len(jobs), location.String(), cap(runner.jobSlots))
 
@@ -1856,13 +1971,21 @@ func (r *templateRunner) launchJob(ctx context.Context, job jobConfig, triggerTi
 		defer cancel()
 
 		fmt.Fprintf(r.out, "[%s] start job %s (%s)\n", startedAt.Format(time.RFC3339), job.Name, job.Type)
+		if err := r.status.markJobStarted(job, startedAt); err != nil {
+			fmt.Fprintf(r.errOut, "[%s] status file update failed for job %s: %v\n", startedAt.Format(time.RFC3339), job.Name, err)
+		}
+
 		err := r.runJob(jobCtx, job)
 		duration := time.Since(startedAt).Round(time.Millisecond)
+		finishedAt := time.Now()
+		if statusErr := r.status.markJobFinished(job, finishedAt, duration, err); statusErr != nil {
+			fmt.Fprintf(r.errOut, "[%s] status file update failed for job %s: %v\n", finishedAt.Format(time.RFC3339), job.Name, statusErr)
+		}
 		if err != nil {
-			fmt.Fprintf(r.errOut, "[%s] fail job %s duration=%s error=%v\n", time.Now().Format(time.RFC3339), job.Name, duration, err)
+			fmt.Fprintf(r.errOut, "[%s] fail job %s duration=%s error=%v\n", finishedAt.Format(time.RFC3339), job.Name, duration, err)
 			return
 		}
-		fmt.Fprintf(r.out, "[%s] finish job %s duration=%s\n", time.Now().Format(time.RFC3339), job.Name, duration)
+		fmt.Fprintf(r.out, "[%s] finish job %s duration=%s\n", finishedAt.Format(time.RFC3339), job.Name, duration)
 	}(job, triggerTime)
 }
 

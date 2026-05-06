@@ -501,13 +501,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "backuper_restic_snapshots_total",
-          "legendFormat": "snapshots",
+          "expr": "backuper_restic_repository_configured",
+          "legendFormat": "repository",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Restic Snapshots",
+      "title": "Restic Repository",
       "type": "stat"
     },
     {
@@ -569,13 +569,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "backuper_restic_latest_snapshot_age_seconds / 3600",
-          "legendFormat": "latest snapshot age",
+          "expr": "(time() - backuper_status_file_updated_timestamp_seconds) / 3600",
+          "legendFormat": "status file age",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Latest Restic Snapshot Age",
+      "title": "Status File Age",
       "type": "stat"
     },
     {
