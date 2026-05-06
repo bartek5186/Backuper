@@ -109,6 +109,13 @@ type healthResponse struct {
 	Jobs []jobHealthStatus `json:"jobs"`
 }
 
+type jobHealthCollection struct {
+	Statuses       []jobHealthStatus
+	Snapshots      []resticSnapshotSummary
+	NeedsSnapshots bool
+	ResticError    error
+}
+
 type resticSnapshotSummary struct {
 	ID      string    `json:"id"`
 	ShortID string    `json:"short_id,omitempty"`
@@ -867,6 +874,7 @@ func (s *apiServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/restic/snapshots", s.handleResticSnapshots)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	return mux
 }
 
@@ -912,7 +920,31 @@ func (s *apiServer) handleResticSnapshots(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (s *apiServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), defaultAPIRequestTimeout)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if err := s.writePrometheusMetrics(ctx, w, time.Now()); err != nil {
+		fmt.Fprintf(s.errOut, "metrics collection error: %v\n", err)
+	}
+}
+
 func (s *apiServer) collectJobHealthStatuses(ctx context.Context) ([]jobHealthStatus, error) {
+	collection, err := s.collectJobHealth(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return collection.Statuses, nil
+}
+
+func (s *apiServer) collectJobHealth(ctx context.Context) (jobHealthCollection, error) {
 	statuses := make([]jobHealthStatus, 0, len(s.jobs))
 	now := time.Now()
 	dbJobUsesRestic := make(map[string]bool, len(s.jobs))
@@ -1003,7 +1035,175 @@ func (s *apiServer) collectJobHealthStatuses(ctx context.Context) ([]jobHealthSt
 		statuses = append(statuses, status)
 	}
 
-	return statuses, nil
+	return jobHealthCollection{
+		Statuses:       statuses,
+		Snapshots:      snapshots,
+		NeedsSnapshots: needsSnapshots,
+		ResticError:    resticError,
+	}, nil
+}
+
+func (s *apiServer) writePrometheusMetrics(ctx context.Context, out io.Writer, now time.Time) error {
+	collection, err := s.collectJobHealth(ctx)
+	healthCollectionOK := err == nil
+	if err != nil {
+		collection.Statuses = nil
+	}
+
+	jobTypes := make(map[string]string, len(s.jobs))
+	for _, job := range s.jobs {
+		jobTypes[job.Name] = job.Type
+	}
+
+	fmt.Fprintln(out, "# HELP backuper_metrics_collection_success Whether a metrics collector completed successfully.")
+	fmt.Fprintln(out, "# TYPE backuper_metrics_collection_success gauge")
+	writeGauge(out, "backuper_metrics_collection_success", map[string]string{"collector": "health"}, boolFloat(healthCollectionOK))
+
+	fmt.Fprintln(out, "# HELP backuper_jobs_configured_total Number of configured backuper jobs.")
+	fmt.Fprintln(out, "# TYPE backuper_jobs_configured_total gauge")
+	writeGauge(out, "backuper_jobs_configured_total", nil, float64(len(s.jobs)))
+
+	fmt.Fprintln(out, "# HELP backuper_jobs_running Number of currently running or queued backuper jobs.")
+	fmt.Fprintln(out, "# TYPE backuper_jobs_running gauge")
+	writeGauge(out, "backuper_jobs_running", nil, float64(s.runner.runningJobCount()))
+
+	fmt.Fprintln(out, "# HELP backuper_max_concurrent_jobs Maximum number of backup jobs allowed to run concurrently.")
+	fmt.Fprintln(out, "# TYPE backuper_max_concurrent_jobs gauge")
+	writeGauge(out, "backuper_max_concurrent_jobs", nil, float64(cap(s.runner.jobSlots)))
+
+	fmt.Fprintln(out, "# HELP backuper_job_configured Configured backuper job metadata.")
+	fmt.Fprintln(out, "# TYPE backuper_job_configured gauge")
+	for _, job := range s.jobs {
+		writeGauge(out, "backuper_job_configured", jobMetricLabels(job.Name, job.Type), 1)
+	}
+
+	fmt.Fprintln(out, "# HELP backuper_job_healthy Whether a backuper job has a fresh successful backup.")
+	fmt.Fprintln(out, "# TYPE backuper_job_healthy gauge")
+	fmt.Fprintln(out, "# HELP backuper_job_error Whether a backuper job currently reports an error.")
+	fmt.Fprintln(out, "# TYPE backuper_job_error gauge")
+	fmt.Fprintln(out, "# HELP backuper_job_last_success_timestamp_seconds Unix timestamp of the latest successful backup for a job.")
+	fmt.Fprintln(out, "# TYPE backuper_job_last_success_timestamp_seconds gauge")
+	fmt.Fprintln(out, "# HELP backuper_job_last_success_age_seconds Age in seconds of the latest successful backup for a job.")
+	fmt.Fprintln(out, "# TYPE backuper_job_last_success_age_seconds gauge")
+	for _, status := range collection.Statuses {
+		labels := jobMetricLabels(status.Name, jobTypes[status.Name])
+		writeGauge(out, "backuper_job_healthy", labels, boolFloat(status.Healthy))
+		writeGauge(out, "backuper_job_error", labels, boolFloat(status.Error != ""))
+		if status.LastSuccessAt != nil {
+			writeGauge(out, "backuper_job_last_success_timestamp_seconds", labels, float64(status.LastSuccessAt.Unix()))
+			writeGauge(out, "backuper_job_last_success_age_seconds", labels, now.Sub(*status.LastSuccessAt).Seconds())
+		}
+	}
+
+	snapshots, resticErr := s.metricsResticSnapshots(ctx, collection)
+	resticOK := resticErr == nil
+	writeGauge(out, "backuper_metrics_collection_success", map[string]string{"collector": "restic"}, boolFloat(resticOK))
+	if shouldCollectResticMetrics(s.runner.cfg.Restic) {
+		repositoryLabels := map[string]string{"repository": s.runner.cfg.Restic.Repository}
+
+		fmt.Fprintln(out, "# HELP backuper_restic_snapshots_total Number of restic snapshots in the configured repository.")
+		fmt.Fprintln(out, "# TYPE backuper_restic_snapshots_total gauge")
+		writeGauge(out, "backuper_restic_snapshots_total", repositoryLabels, float64(len(snapshots)))
+
+		if latest, ok := latestResticSnapshotTime(snapshots); ok {
+			fmt.Fprintln(out, "# HELP backuper_restic_latest_snapshot_timestamp_seconds Unix timestamp of the newest restic snapshot.")
+			fmt.Fprintln(out, "# TYPE backuper_restic_latest_snapshot_timestamp_seconds gauge")
+			writeGauge(out, "backuper_restic_latest_snapshot_timestamp_seconds", repositoryLabels, float64(latest.Unix()))
+
+			fmt.Fprintln(out, "# HELP backuper_restic_latest_snapshot_age_seconds Age in seconds of the newest restic snapshot.")
+			fmt.Fprintln(out, "# TYPE backuper_restic_latest_snapshot_age_seconds gauge")
+			writeGauge(out, "backuper_restic_latest_snapshot_age_seconds", repositoryLabels, now.Sub(latest).Seconds())
+		}
+	}
+
+	if err != nil {
+		return err
+	}
+	if resticErr != nil {
+		return resticErr
+	}
+
+	return nil
+}
+
+func (s *apiServer) metricsResticSnapshots(ctx context.Context, collection jobHealthCollection) ([]resticSnapshotSummary, error) {
+	if !shouldCollectResticMetrics(s.runner.cfg.Restic) {
+		return nil, nil
+	}
+	if collection.NeedsSnapshots {
+		return collection.Snapshots, collection.ResticError
+	}
+
+	snapshots, err := s.runner.listResticSnapshotSummaries(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return snapshots, nil
+}
+
+func shouldCollectResticMetrics(restic resticConfig) bool {
+	return strings.TrimSpace(restic.Binary) != "" && strings.TrimSpace(restic.Repository) != ""
+}
+
+func latestResticSnapshotTime(snapshots []resticSnapshotSummary) (time.Time, bool) {
+	if len(snapshots) == 0 {
+		return time.Time{}, false
+	}
+
+	latest := snapshots[0].Time
+	for _, snapshot := range snapshots[1:] {
+		if snapshot.Time.After(latest) {
+			latest = snapshot.Time
+		}
+	}
+
+	return latest, true
+}
+
+func jobMetricLabels(name, jobType string) map[string]string {
+	return map[string]string{
+		"name": name,
+		"type": jobType,
+	}
+}
+
+func boolFloat(value bool) float64 {
+	if value {
+		return 1
+	}
+
+	return 0
+}
+
+func writeGauge(out io.Writer, name string, labels map[string]string, value float64) {
+	formattedValue := strconv.FormatFloat(value, 'f', -1, 64)
+	if len(labels) == 0 {
+		fmt.Fprintf(out, "%s %s\n", name, formattedValue)
+		return
+	}
+
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	fmt.Fprintf(out, "%s{", name)
+	for i, key := range keys {
+		if i > 0 {
+			fmt.Fprint(out, ",")
+		}
+		fmt.Fprintf(out, `%s="%s"`, key, prometheusLabelValue(labels[key]))
+	}
+	fmt.Fprintf(out, "} %s\n", formattedValue)
+}
+
+func prometheusLabelValue(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
 }
 
 func latestDatabaseDumpSuccess(job jobConfig) (*time.Time, error) {
@@ -1696,6 +1896,12 @@ func (r *templateRunner) finish(jobName string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.running, jobName)
+}
+
+func (r *templateRunner) runningJobCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.running)
 }
 
 func (r *templateRunner) Wait() {

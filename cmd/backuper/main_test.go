@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -970,6 +971,86 @@ func TestHandleHealthRejectsNonGET(t *testing.T) {
 	recorder := httptest.NewRecorder()
 
 	server.handleHealth(recorder, request)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("unexpected status code: got %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestWritePrometheusMetricsIncludesHealthAndResticMetrics(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "secret")
+
+	now := time.Date(2026, time.May, 5, 7, 0, 0, 0, time.UTC)
+	latestSnapshotAt := now.Add(-time.Hour)
+	oldSnapshotAt := now.Add(-2 * time.Hour)
+
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "fake-restic.sh")
+	script := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' '[{"id":"latest","time":"` + latestSnapshotAt.Format(time.RFC3339) + `","tags":["data"],"paths":["/srv/data"]},{"id":"old","time":"` + oldSnapshotAt.Format(time.RFC3339) + `","tags":["data"],"paths":["/srv/data"]}]'
+`
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	repository := "sftp://footballmat@warehouse:9990//backups/footballmat"
+	runner := newTemplateRunner(config{
+		App: appConfig{
+			MaxConcurrentJobs: 1,
+		},
+		Restic: resticConfig{
+			Binary:     binaryPath,
+			Repository: repository,
+		},
+	}, os.Stdout, os.Stderr)
+	jobs := []jobConfig{
+		{
+			Name:           "footballmat_data",
+			Type:           "restic_backup",
+			Sources:        []string{"/srv/data"},
+			Tags:           []string{"data"},
+			Schedule:       "0 6 * * *",
+			TimeoutMinutes: 60,
+		},
+	}
+
+	server := newAPIServerWithRunner(runner, jobs, os.Stdout, os.Stderr)
+	var output bytes.Buffer
+
+	if err := server.writePrometheusMetrics(context.Background(), &output, now); err != nil {
+		t.Fatalf("writePrometheusMetrics() error = %v", err)
+	}
+
+	body := output.String()
+	wantFragments := []string{
+		`backuper_metrics_collection_success{collector="health"} 1`,
+		`backuper_metrics_collection_success{collector="restic"} 1`,
+		`backuper_jobs_configured_total 1`,
+		`backuper_max_concurrent_jobs 1`,
+		`backuper_job_configured{name="footballmat_data",type="restic_backup"} 1`,
+		`backuper_job_healthy{name="footballmat_data",type="restic_backup"} 1`,
+		`backuper_job_error{name="footballmat_data",type="restic_backup"} 0`,
+		`backuper_job_last_success_timestamp_seconds{name="footballmat_data",type="restic_backup"} ` + strconv.FormatInt(latestSnapshotAt.Unix(), 10),
+		`backuper_job_last_success_age_seconds{name="footballmat_data",type="restic_backup"} 3600`,
+		`backuper_restic_snapshots_total{repository="` + repository + `"} 2`,
+		`backuper_restic_latest_snapshot_timestamp_seconds{repository="` + repository + `"} ` + strconv.FormatInt(latestSnapshotAt.Unix(), 10),
+		`backuper_restic_latest_snapshot_age_seconds{repository="` + repository + `"} 3600`,
+	}
+	for _, fragment := range wantFragments {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("expected metrics output containing %q, got:\n%s", fragment, body)
+		}
+	}
+}
+
+func TestHandleMetricsRejectsNonGET(t *testing.T) {
+	server := newAPIServer(config{}, os.Stdout, os.Stderr)
+
+	request := httptest.NewRequest(http.MethodPost, "/metrics", nil)
+	recorder := httptest.NewRecorder()
+
+	server.handleMetrics(recorder, request)
 
 	if recorder.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("unexpected status code: got %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
