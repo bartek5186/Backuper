@@ -152,6 +152,11 @@ type statusStore struct {
 	mu   sync.Mutex
 }
 
+type statusBootstrapResult struct {
+	lastSuccessByJob map[string]*time.Time
+	errorByJob       map[string]string
+}
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -293,6 +298,7 @@ func runServe(args []string) int {
 
 	runner := newTemplateRunner(cfg, os.Stdout, os.Stderr)
 	runner.ensureStatusFile(selectedJobs)
+	runner.bootstrapStatusFromExistingBackups(context.Background(), selectedJobs)
 	api := newAPIServerWithRunner(runner, selectedJobs, os.Stdout, os.Stderr)
 	httpServer := &http.Server{
 		Addr:    *listenAddress,
@@ -450,6 +456,7 @@ func runAPI(args []string) int {
 
 	server := newAPIServer(cfg, os.Stdout, os.Stderr)
 	server.runner.ensureStatusFile(cfg.Jobs)
+	server.runner.bootstrapStatusFromExistingBackups(context.Background(), cfg.Jobs)
 	httpServer := &http.Server{
 		Addr:    *listenAddress,
 		Handler: server.routes(),
@@ -537,6 +544,7 @@ func runScheduler(args []string) int {
 
 	runner := newTemplateRunner(cfg, os.Stdout, os.Stderr)
 	runner.ensureStatusFile(selectedJobs)
+	runner.bootstrapStatusFromExistingBackups(context.Background(), selectedJobs)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -933,6 +941,35 @@ func (s *statusStore) markJobFinished(job jobConfig, finishedAt time.Time, durat
 			record.LastError = ""
 		}
 		state.UpdatedAt = finishedAt
+	})
+}
+
+func (s *statusStore) applyBootstrap(jobs []jobConfig, resticRepository string, maxConcurrentJobs int, result statusBootstrapResult, now time.Time) error {
+	return s.update(func(state *statusFile) {
+		state.ResticRepository = resticRepository
+		state.MaxConcurrentJobs = maxConcurrentJobs
+		mergeConfiguredJobs(state, jobs)
+
+		for _, job := range jobs {
+			record := statusRecordForJob(state, job)
+			record.Type = job.Type
+			record.Running = false
+
+			if lastSuccessAt, ok := result.lastSuccessByJob[job.Name]; ok && lastSuccessAt != nil {
+				record.LastSuccessAt = timePtr(*lastSuccessAt)
+				if record.LastFinishedAt == nil || lastSuccessAt.After(*record.LastFinishedAt) {
+					record.LastFinishedAt = timePtr(*lastSuccessAt)
+				}
+				record.LastError = ""
+				continue
+			}
+
+			if message := strings.TrimSpace(result.errorByJob[job.Name]); message != "" {
+				record.LastError = message
+			}
+		}
+
+		state.UpdatedAt = now
 	})
 }
 
@@ -1927,6 +1964,86 @@ func (r *templateRunner) dispatchSelectedJobs(ctx context.Context, jobs []jobCon
 func (r *templateRunner) ensureStatusFile(jobs []jobConfig) {
 	if err := r.status.ensureJobs(jobs, r.cfg.Restic.Repository, cap(r.jobSlots), time.Now()); err != nil {
 		fmt.Fprintf(r.errOut, "status file update failed: %v\n", err)
+	}
+}
+
+func (r *templateRunner) bootstrapStatusFromExistingBackups(ctx context.Context, jobs []jobConfig) {
+	if len(jobs) == 0 {
+		return
+	}
+
+	bootstrapCtx, cancel := context.WithTimeout(ctx, defaultAPIRequestTimeout)
+	defer cancel()
+
+	result := statusBootstrapResult{
+		lastSuccessByJob: make(map[string]*time.Time, len(jobs)),
+		errorByJob:       make(map[string]string),
+	}
+
+	snapshots, resticErr := r.bootstrapResticSnapshots(bootstrapCtx, jobs)
+	for _, job := range jobs {
+		lastSuccessAt, err := r.bootstrapJobLastSuccess(job, snapshots, resticErr)
+		if err != nil {
+			result.errorByJob[job.Name] = err.Error()
+			fmt.Fprintf(r.errOut, "[%s] status bootstrap failed for job %s: %v\n", time.Now().Format(time.RFC3339), job.Name, err)
+			continue
+		}
+		if lastSuccessAt != nil {
+			result.lastSuccessByJob[job.Name] = lastSuccessAt
+		}
+	}
+
+	if err := r.status.applyBootstrap(jobs, r.cfg.Restic.Repository, cap(r.jobSlots), result, time.Now()); err != nil {
+		fmt.Fprintf(r.errOut, "status file bootstrap update failed: %v\n", err)
+	}
+}
+
+func (r *templateRunner) bootstrapResticSnapshots(ctx context.Context, jobs []jobConfig) ([]resticSnapshotSummary, error) {
+	if !r.bootstrapNeedsResticSnapshots(jobs) {
+		return nil, nil
+	}
+
+	fmt.Fprintf(r.out, "[%s] status bootstrap: reading restic snapshots once\n", time.Now().Format(time.RFC3339))
+	return r.listResticSnapshotSummaries(ctx, nil)
+}
+
+func (r *templateRunner) bootstrapNeedsResticSnapshots(jobs []jobConfig) bool {
+	for _, job := range jobs {
+		switch job.Type {
+		case "restic_backup":
+			return true
+		case "database_dump":
+			useRestic, err := r.cfg.databaseResticEnabledForJob(job)
+			if err == nil && useRestic {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (r *templateRunner) bootstrapJobLastSuccess(job jobConfig, snapshots []resticSnapshotSummary, resticErr error) (*time.Time, error) {
+	switch job.Type {
+	case "restic_backup":
+		if resticErr != nil {
+			return nil, resticErr
+		}
+		return latestResticJobSuccess(job, snapshots)
+	case "database_dump":
+		useRestic, err := r.cfg.databaseResticEnabledForJob(job)
+		if err != nil {
+			return nil, err
+		}
+		if useRestic {
+			if resticErr != nil {
+				return nil, resticErr
+			}
+			return latestDatabaseDumpResticSuccess(job, snapshots)
+		}
+		return latestDatabaseDumpSuccess(job)
+	default:
+		return nil, fmt.Errorf("unsupported job type %q", job.Type)
 	}
 }
 

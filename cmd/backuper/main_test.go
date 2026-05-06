@@ -1044,6 +1044,105 @@ exit 99
 	}
 }
 
+func TestTemplateRunnerBootstrapsPassiveStatusFromExistingBackups(t *testing.T) {
+	t.Setenv(resticPasswordEnv, "secret")
+
+	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "status.json")
+	resticArgsPath := filepath.Join(dir, "restic-args.txt")
+	resticBinaryPath := filepath.Join(dir, "fake-restic.sh")
+	resticSuccessAt := time.Date(2026, time.May, 5, 6, 0, 0, 0, time.UTC)
+	localSuccessAt := time.Date(2026, time.May, 5, 5, 0, 0, 0, time.UTC)
+	t.Setenv("TEST_RESTIC_ARGS_FILE", resticArgsPath)
+
+	resticScript := `#!/usr/bin/env bash
+set -eu
+printf '%s ' "$@" >> "$TEST_RESTIC_ARGS_FILE"
+printf '\n' >> "$TEST_RESTIC_ARGS_FILE"
+printf '%s\n' '[{"id":"snap1","time":"` + resticSuccessAt.Format(time.RFC3339) + `","tags":["uploads"],"paths":["/srv/uploads"]}]'
+`
+	if err := os.WriteFile(resticBinaryPath, []byte(resticScript), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	localDumpDir := filepath.Join(dir, "local-db")
+	if err := os.MkdirAll(localDumpDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	localDumpPath := filepath.Join(localDumpDir, "local_db_2026-05-05_05-00-00.sql.gz")
+	if err := os.WriteFile(localDumpPath, []byte("dump"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chtimes(localDumpPath, localSuccessAt, localSuccessAt); err != nil {
+		t.Fatalf("Chtimes() error = %v", err)
+	}
+
+	resticDisabled := false
+	runner := newTemplateRunner(config{
+		App: appConfig{
+			StatusFile: statusPath,
+		},
+		Database: databaseConfigList{{
+			Type:   "mariadb",
+			Restic: &resticDisabled,
+		}},
+		Restic: resticConfig{
+			Binary:     resticBinaryPath,
+			Repository: "/tmp/restic-repo",
+		},
+	}, os.Stdout, os.Stderr)
+	jobs := []jobConfig{
+		{
+			Name:           "local_db",
+			Type:           "database_dump",
+			TimeoutMinutes: 60,
+			DatabaseName:   "myapp",
+			Host:           "127.0.0.1",
+			Port:           3306,
+			User:           "backup_user",
+			Password:       "BACKUP_DB_PASSWORD",
+			OutputDir:      localDumpDir,
+		},
+		{
+			Name:           "uploads",
+			Type:           "restic_backup",
+			TimeoutMinutes: 60,
+			Sources:        []string{"/srv/uploads"},
+			Tags:           []string{"uploads"},
+		},
+	}
+
+	runner.ensureStatusFile(jobs)
+	runner.bootstrapStatusFromExistingBackups(context.Background(), jobs)
+
+	state, err := runner.status.read()
+	if err != nil {
+		t.Fatalf("status.read() error = %v", err)
+	}
+	records := statusRecordsByName(state)
+	if records["local_db"].LastSuccessAt == nil || !records["local_db"].LastSuccessAt.Equal(localSuccessAt) {
+		t.Fatalf("unexpected local db bootstrap success: %#v", records["local_db"].LastSuccessAt)
+	}
+	if records["uploads"].LastSuccessAt == nil || !records["uploads"].LastSuccessAt.Equal(resticSuccessAt) {
+		t.Fatalf("unexpected restic bootstrap success: %#v", records["uploads"].LastSuccessAt)
+	}
+
+	argsBytes, err := os.ReadFile(resticArgsPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	args := strings.Fields(string(argsBytes))
+	wantArgs := []string{"-r", "/tmp/restic-repo", "snapshots", "--json"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("unexpected restic bootstrap args: got %#v, want %#v", args, wantArgs)
+	}
+	for i := range wantArgs {
+		if args[i] != wantArgs[i] {
+			t.Fatalf("unexpected restic bootstrap args: got %#v, want %#v", args, wantArgs)
+		}
+	}
+}
+
 func TestHandleMetricsRejectsNonGET(t *testing.T) {
 	server := newAPIServer(config{}, os.Stdout, os.Stderr)
 

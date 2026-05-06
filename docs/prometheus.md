@@ -10,6 +10,14 @@ The metrics endpoint only reads the local status file configured by `app.status_
 It does not execute `restic`, does not scan backup directories, and does not query the remote repository.
 The status file is updated when jobs start and finish.
 
+On process startup, backuper performs a one-time status bootstrap:
+
+- restic jobs read `restic snapshots --json` once,
+- database dump jobs without restic scan their local dump directory once,
+- the discovered `last_success_at` values are written to `app.status_file`.
+
+After that bootstrap, idle metrics and health checks remain passive and only read the status file.
+
 Example config:
 
 ```json
